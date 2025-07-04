@@ -70,25 +70,27 @@ TrueTone/
 
 ## 🎯 Development Roadmap
 
-### Phase 1: Foundation
-- [ ] Set up Chrome extension boilerplate
-- [ ] Create FastAPI backend structure
-- [ ] Implement basic audio capture
-- [ ] Set up WebSocket communication
+### Phase 1: Foundation ✅ COMPLETED
+- [x] Set up Chrome extension boilerplate
+- [x] Create FastAPI backend structure
+- [x] Implement basic audio capture
+- [x] Set up WebSocket communication
+- [x] Create extension UI and icons
+- [x] Establish YouTube integration
 
-### Phase 2: Core Pipeline
+### Phase 2: Core Pipeline (IN PROGRESS)
 - [ ] Integrate Whisper for transcription
 - [ ] Add translation service
 - [ ] Implement voice embedding
 - [ ] Set up TTS synthesis
 
-### Phase 3: Integration
+### Phase 3: Integration (PLANNED)
 - [ ] Real-time audio processing
 - [ ] Synchronization with video
 - [ ] UI/UX improvements
 - [ ] Performance optimization
 
-### Phase 4: Polish
+### Phase 4: Polish (PLANNED)
 - [ ] Testing and debugging
 - [ ] Documentation
 - [ ] Deployment preparation
@@ -97,22 +99,45 @@ TrueTone/
 
 ### Prerequisites
 - Python 3.8+
-- Node.js (for extension development)
-- Chrome browser
-- GPU recommended for ML models
+- Google Chrome browser
+- Git (for development)
 
-### Installation
+### Installation & Setup
+
+#### 1. Clone the Repository
 ```bash
-# Clone repository
 git clone https://github.com/mpat247/TrueTone.git
 cd TrueTone
+```
 
+#### 2. Set Up the Backend
+```bash
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Set up Chrome extension
-# (Load unpacked extension in Chrome developer mode)
+# Start the backend server
+./start_backend.sh
 ```
+The backend will be available at `http://localhost:8000`
+
+#### 3. Load the Chrome Extension
+1. Open Chrome and go to `chrome://extensions/`
+2. Enable **"Developer mode"** (toggle in top-right)
+3. Click **"Load unpacked"**
+4. Select the `chrome-extension` folder from this project
+5. The TrueTone extension should now appear in your toolbar
+
+#### 4. Test the Extension
+1. Go to any YouTube video
+2. Click the 🎵 TrueTone extension icon
+3. You should see the beautiful gradient popup interface
+4. Try the translation controls (backend integration required for full functionality)
+
+### Current Status
+- ✅ **Chrome Extension**: Fully functional with UI and YouTube integration
+- ✅ **Backend**: Basic FastAPI server with WebSocket support
+- ⏳ **ML Pipeline**: Ready for integration (Whisper, Translation, TTS)
+- ⏳ **Audio Processing**: Framework ready, models to be integrated
 
 ## 🔮 Future Enhancements
 - Multi-speaker support

@@ -16,7 +16,6 @@ class AudioCaptureManager {
     this.lastChunkTime = 0;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
-    this.websocket = null;
     this.audioQualityMetrics = {
       averageLevel: 0,
       peakLevel: 0,
@@ -66,13 +65,6 @@ class AudioCaptureManager {
       this.processorNode.connect(this.audioContext.destination);
       
       this.isCapturing = true;
-      
-      // Start quality monitoring
-      this.startQualityMonitoring();
-      
-      // Start periodic synchronization
-      this.startPeriodicSync();
-      
       console.log('Audio capture initialized successfully');
       
       return true;
@@ -80,36 +72,6 @@ class AudioCaptureManager {
       console.error('Failed to initialize audio capture:', error);
       await this.handleCaptureError(error);
       return false;
-    }
-  }
-
-  startQualityMonitoring() {
-    // Monitor audio quality every 5 seconds
-    this.qualityMonitorInterval = setInterval(() => {
-      if (this.isCapturing) {
-        this.requestQualityCheck();
-      }
-    }, 5000);
-  }
-
-  startPeriodicSync() {
-    // Sync clocks every 30 seconds
-    this.syncInterval = setInterval(() => {
-      if (this.isCapturing && this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-        this.requestClockSync();
-      }
-    }, 30000);
-  }
-
-  stopQualityMonitoring() {
-    if (this.qualityMonitorInterval) {
-      clearInterval(this.qualityMonitorInterval);
-      this.qualityMonitorInterval = null;
-    }
-    
-    if (this.syncInterval) {
-      clearInterval(this.syncInterval);
-      this.syncInterval = null;
     }
   }
 
@@ -200,41 +162,25 @@ class AudioCaptureManager {
     if (this.audioBuffer.length === 0 || !this.websocket) return;
     
     try {
-      // Convert audio buffer to Float32Array for proper encoding
-      const audioFloat32 = new Float32Array(this.audioBuffer);
-      
-      // Convert to base64 for transmission
-      const audioBytes = new Uint8Array(audioFloat32.buffer);
-      const base64Audio = btoa(String.fromCharCode.apply(null, audioBytes));
-      
-      // Create audio chunk data matching backend protocol
+      // Create audio chunk data
       const chunkData = {
         type: 'audio_chunk',
         sequence: this.sequenceNumber++,
         timestamp: Date.now(),
         sampleRate: this.sampleRate,
         channels: 1,
-        data: base64Audio, // Base64 encoded audio data
-        metadata: {
-          bufferSize: this.audioBuffer.length,
-          quality: {
-            averageLevel: this.audioQualityMetrics.averageLevel,
-            peakLevel: this.audioQualityMetrics.peakLevel,
-            hasClipping: this.audioQualityMetrics.clipCount > 0,
-            isSilent: this.audioQualityMetrics.silenceCount > this.bufferSize * 0.9,
-            snrEstimate: this.calculateSNR()
-          },
-          compression: {
-            enabled: true,
-            preferredAlgorithm: 'lz4' // Fast compression for real-time
-          }
+        data: this.audioBuffer.slice(), // Copy buffer
+        quality: {
+          averageLevel: this.audioQualityMetrics.averageLevel,
+          peakLevel: this.audioQualityMetrics.peakLevel,
+          hasClipping: this.audioQualityMetrics.clipCount > 0,
+          isSilent: this.audioQualityMetrics.silenceCount > this.bufferSize * 0.9
         }
       };
       
       // Send via WebSocket
       if (this.websocket.readyState === WebSocket.OPEN) {
         this.websocket.send(JSON.stringify(chunkData));
-        console.debug(`Sent audio chunk: ${this.audioBuffer.length} samples, sequence ${chunkData.sequence}`);
       }
       
       // Clear buffer and reset metrics
@@ -249,36 +195,24 @@ class AudioCaptureManager {
     }
   }
 
-  calculateSNR() {
-    if (this.audioBuffer.length === 0) return 0;
-    
-    // Calculate signal power (RMS)
-    const signalPower = this.audioBuffer.reduce((sum, sample) => sum + sample * sample, 0) / this.audioBuffer.length;
-    
-    // Estimate noise floor (10th percentile of squared samples)
-    const sortedSquared = this.audioBuffer.map(s => s * s).sort((a, b) => a - b);
-    const noiseFloor = sortedSquared[Math.floor(sortedSquared.length * 0.1)] || 1e-10;
-    
-    // Calculate SNR in dB
-    return 10 * Math.log10(signalPower / noiseFloor);
-  }
-
   async handleCaptureError(error) {
     console.error('Audio capture error:', error);
     
     if (error.name === 'NotAllowedError') {
       console.error('Microphone permission denied');
+      // Could trigger permission request UI
     } else if (error.name === 'NotFoundError') {
       console.error('No audio device found');
     } else if (error.name === 'OverconstrainedError') {
       console.error('Audio constraints not supported');
+      // Could try with relaxed constraints
       await this.retryWithRelaxedConstraints();
     }
     
     // Attempt recovery
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
-      const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+      const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000); // Exponential backoff, max 30s
       console.log(`Retrying audio capture in ${delay}ms (attempt ${this.reconnectAttempts})`);
       setTimeout(() => this.initializeAudioCapture(), delay);
     }
@@ -346,13 +280,6 @@ class AudioCaptureManager {
         this.websocket.onopen = () => {
           console.log('Connected to TrueTone backend');
           this.reconnectAttempts = 0;
-          
-          // Send initial configuration
-          this.sendAudioConfig();
-          
-          // Request clock synchronization
-          this.requestClockSync();
-          
           resolve();
         };
         
@@ -383,213 +310,22 @@ class AudioCaptureManager {
     });
   }
 
-  sendAudioConfig() {
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      const configMessage = {
-        type: 'audio_config',
-        config: {
-          action: 'start',
-          sampleRate: this.sampleRate,
-          channels: 1,
-          bufferSize: this.bufferSize,
-          format: 'float32',
-          compression: {
-            enabled: true,
-            preferredAlgorithm: 'lz4'
-          }
-        }
-      };
-      
-      this.websocket.send(JSON.stringify(configMessage));
-      console.log('Sent audio configuration to backend');
-    }
-  }
-
-  requestClockSync() {
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      const syncMessage = {
-        type: 'sync_request',
-        client_time: Date.now() / 1000 // Convert to seconds
-      };
-      
-      this.websocket.send(JSON.stringify(syncMessage));
-      console.log('Requested clock synchronization');
-    }
-  }
-
-  requestQualityCheck() {
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      const qualityMessage = {
-        type: 'quality_check',
-        timestamp: Date.now()
-      };
-      
-      this.websocket.send(JSON.stringify(qualityMessage));
-    }
-  }
-
-  requestStats() {
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      const statsMessage = {
-        type: 'stats_request',
-        stats_type: 'all',
-        timestamp: Date.now()
-      };
-      
-      this.websocket.send(JSON.stringify(statsMessage));
-    }
-  }
-
   handleBackendMessage(data) {
     switch (data.type) {
-      case 'connection_established':
-        console.log('Backend connection established:', data);
-        this.serverTimeOffset = data.server_time - (Date.now() / 1000);
-        break;
-        
-      case 'audio_chunk_processed':
-        console.debug('Audio chunk processed:', data.sequence, data.status);
-        if (data.buffer_stats) {
-          this.handleBufferStats(data.buffer_stats);
-        }
-        break;
-        
-      case 'audio_config_response':
-        console.log('Audio config response:', data.status);
-        if (data.status === 'started') {
-          console.log('Backend audio capture started successfully');
-        }
-        break;
-        
-      case 'sync_response':
-        console.log('Clock sync response:', data);
-        this.serverTimeOffset = data.server_time - data.client_time;
-        console.log(`Clock sync: offset = ${this.serverTimeOffset}s, jitter = ${data.jitter_estimate}ms`);
-        break;
-        
-      case 'quality_check_response':
-        console.log('Quality check response:', data);
-        this.handleQualityRecommendations(data);
-        break;
-        
-      case 'stats_response':
-        console.log('Stats response:', data);
-        this.handleStatsUpdate(data);
-        break;
-        
       case 'translated_audio':
         this.playTranslatedAudio(data);
         break;
-        
-      case 'stream_control_response':
-        console.log('Stream control response:', data.command, data.status);
+      case 'status_update':
+        console.log('Backend status:', data.status);
         break;
-        
       case 'error':
         console.error('Backend error:', data.message);
-        this.handleBackendError(data);
         break;
-        
+      case 'quality_feedback':
+        this.adjustQualitySettings(data);
+        break;
       default:
-        console.log('Unknown message type:', data.type, data);
-    }
-  }
-
-  handleBufferStats(bufferStats) {
-    // Monitor buffer health
-    if (bufferStats.utilization > 80) {
-      console.warn('Backend buffer utilization high:', bufferStats.utilization + '%');
-      // Could reduce chunk size or increase send frequency
-    }
-    
-    if (bufferStats.overflow_count > 0) {
-      console.warn('Backend buffer overflow detected:', bufferStats.overflow_count);
-    }
-  }
-
-  handleQualityRecommendations(qualityData) {
-    const recommendations = qualityData.recommendations || [];
-    const metrics = qualityData.quality_metrics || {};
-    
-    console.log('Audio quality metrics:', metrics);
-    
-    recommendations.forEach(recommendation => {
-      console.log('Quality recommendation:', recommendation);
-    });
-    
-    // Auto-adjust based on recommendations
-    if (recommendations.includes('Low SNR detected - consider noise reduction')) {
-      // Could implement noise gating or filtering
-      console.log('Implementing noise reduction measures');
-    }
-    
-    if (recommendations.includes('Audio clipping detected - reduce input level')) {
-      // Could reduce gain or implement automatic gain control
-      console.log('Reducing audio input level');
-    }
-  }
-
-  handleStatsUpdate(statsData) {
-    if (statsData.capture_stats) {
-      console.log('Capture stats:', statsData.capture_stats);
-    }
-    
-    if (statsData.streaming_stats) {
-      console.log('Streaming stats:', statsData.streaming_stats);
-      
-      // Monitor network quality
-      const networkStats = statsData.streaming_stats;
-      if (networkStats.packet_loss_rate > 0.05) {
-        console.warn('High packet loss detected:', networkStats.packet_loss_rate);
-        this.adaptToNetworkConditions(networkStats);
-      }
-      
-      if (networkStats.average_latency > 300) {
-        console.warn('High latency detected:', networkStats.average_latency + 'ms');
-        this.adaptToNetworkConditions(networkStats);
-      }
-    }
-  }
-
-  adaptToNetworkConditions(networkStats) {
-    // Reduce buffer size for poor network conditions
-    if (networkStats.packet_loss_rate > 0.05 || networkStats.average_latency > 300) {
-      const newBufferSize = Math.max(1024, Math.floor(this.bufferSize * 0.8));
-      if (newBufferSize !== this.bufferSize) {
-        console.log(`Adapting buffer size: ${this.bufferSize} -> ${newBufferSize}`);
-        this.bufferSize = newBufferSize;
-        this.recreateProcessorNode();
-      }
-    }
-  }
-
-  recreateProcessorNode() {
-    if (this.processorNode && this.sourceNode && this.audioContext) {
-      // Disconnect old processor
-      this.processorNode.disconnect();
-      
-      // Create new processor with updated buffer size
-      this.processorNode = this.audioContext.createScriptProcessor(this.bufferSize, 1, 1);
-      this.processorNode.onaudioprocess = this.processAudioData.bind(this);
-      
-      // Reconnect
-      this.sourceNode.connect(this.processorNode);
-      this.processorNode.connect(this.audioContext.destination);
-      
-      console.log('Recreated processor node with buffer size:', this.bufferSize);
-    }
-  }
-
-  handleBackendError(errorData) {
-    console.error('Backend error:', errorData.message);
-    
-    // Handle specific error types
-    if (errorData.message.includes('Audio chunk processing error')) {
-      console.log('Attempting to resend audio configuration');
-      this.sendAudioConfig();
-    } else if (errorData.message.includes('decompression')) {
-      console.log('Disabling compression due to backend error');
-      // Could disable compression in next chunks
+        console.log('Unknown message type:', data.type);
     }
   }
 
@@ -620,9 +356,6 @@ class AudioCaptureManager {
     
     this.isCapturing = false;
     
-    // Stop monitoring
-    this.stopQualityMonitoring();
-    
     // Clean up audio nodes
     if (this.processorNode) {
       this.processorNode.disconnect();
@@ -644,14 +377,6 @@ class AudioCaptureManager {
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach(track => track.stop());
       this.mediaStream = null;
-    }
-    
-    // Send stop command to backend
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      this.websocket.send(JSON.stringify({
-        type: 'audio_config',
-        config: { action: 'stop' }
-      }));
     }
     
     // Close WebSocket
@@ -691,7 +416,6 @@ class TrueToneYouTube {
     
     this.audioCaptureManager = new AudioCaptureManager();
     this.playerStateObserver = null;
-    this.qualityMonitorInterval = null;
     
     this.setupMessageListener();
     this.detectYouTubePlayer();
@@ -793,101 +517,66 @@ class TrueToneYouTube {
   }
   
   detectYouTubePlayer() {
+    // Wait for YouTube player to load
     const checkForPlayer = () => {
-      const player = document.querySelector('#movie_player, .html5-video-player');
+      const player = document.querySelector('video');
       if (player) {
         console.log('YouTube player detected');
-        this.playerElement = player;
-        return true;
+        this.videoElement = player;
+        this.setupPlayerObserver();
+      } else {
+        setTimeout(checkForPlayer, 1000);
       }
-      return false;
     };
-
-    if (!checkForPlayer()) {
-      // Wait for player to load
-      const observer = new MutationObserver((mutations, obs) => {
-        if (checkForPlayer()) {
-          obs.disconnect();
+    
+    checkForPlayer();
+  }
+  
+  setupPlayerObserver() {
+    // Observer for video changes (new video loads)
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        if (mutation.type === 'attributes' && mutation.attributeName === 'src') {
+          console.log('New video detected');
+          if (this.isTranslating) {
+            this.restartTranslation();
+          }
         }
       });
-      
-      observer.observe(document.body, {
-        childList: true,
-        subtree: true
-      });
-    }
+    });
+    
+    observer.observe(this.videoElement, {
+      attributes: true,
+      attributeFilter: ['src']
+    });
   }
   
   createUI() {
-    // Create floating UI element
-    this.uiElement = document.createElement('div');
-    this.uiElement.id = 'truetone-ui';
-    this.uiElement.style.cssText = `
-      position: fixed;
-      top: 100px;
-      right: 20px;
-      width: 250px;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      padding: 15px;
-      border-radius: 10px;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      font-size: 14px;
-      z-index: 10000;
-      display: none;
-      backdrop-filter: blur(10px);
-    `;
-    
-    this.uiElement.innerHTML = `
-      <div style="margin-bottom: 10px;">
-        <strong>🎵 TrueTone</strong>
-        <button id="truetone-close" style="float: right; background: none; border: none; color: white; cursor: pointer; font-size: 16px;">×</button>
-      </div>
-      
-      <div style="margin-bottom: 10px;">
-        <div>Status: <span id="truetone-status">Ready</span></div>
-        <div>Quality: <span id="truetone-quality">Good</span></div>
-      </div>
-      
-      <div style="margin-bottom: 10px;">
-        <div style="margin-bottom: 5px;">Language: ${this.config.targetLanguage}</div>
-        <div style="margin-bottom: 5px;">Volume: ${this.config.volume}%</div>
-        <div>Voice Cloning: ${this.config.voiceCloning ? 'On' : 'Off'}</div>
-      </div>
-      
-      <div>
-        <button id="truetone-toggle" style="
-          background: rgba(255,255,255,0.2);
-          border: 1px solid rgba(255,255,255,0.3);
-          color: white;
-          padding: 8px 16px;
-          border-radius: 5px;
-          cursor: pointer;
-          width: 100%;
-        ">Stop Translation</button>
+    // Create floating UI indicator
+    const ui = document.createElement('div');
+    ui.id = 'truetone-indicator';
+    ui.innerHTML = `
+      <div style="
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 10px 15px;
+        border-radius: 20px;
+        font-family: Arial, sans-serif;
+        font-size: 14px;
+        z-index: 9999;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        display: none;
+      ">
+        🎵 TrueTone: <span id="truetone-status">Ready</span>
       </div>
     `;
     
-    document.body.appendChild(this.uiElement);
-    
-    // Add event listeners
-    document.getElementById('truetone-close').addEventListener('click', () => {
-      this.hideUI();
-    });
-    
-    document.getElementById('truetone-toggle').addEventListener('click', () => {
-      if (this.isTranslating) {
-        this.stopTranslation();
-      } else {
-        this.startTranslation();
-      }
-    });
-    
-    // Store UI elements for easy access
-    this.statusElement = document.getElementById('truetone-status');
-    this.qualityElement = document.getElementById('truetone-quality');
-    this.toggleButton = document.getElementById('truetone-toggle');
+    document.body.appendChild(ui);
+    this.uiElement = ui.querySelector('div');
+    this.statusElement = ui.querySelector('#truetone-status');
   }
   
   showUI() {
@@ -899,26 +588,7 @@ class TrueToneYouTube {
   }
   
   updateStatus(status) {
-    if (this.statusElement) {
-      this.statusElement.textContent = status;
-    }
-  }
-
-  updateQuality(quality) {
-    if (this.qualityElement) {
-      this.qualityElement.textContent = quality;
-      
-      // Color code quality
-      const colors = {
-        'Excellent': '#4CAF50',
-        'Good': '#8BC34A',
-        'Fair': '#FFC107',
-        'Poor': '#FF9800',
-        'Bad': '#F44336'
-      };
-      
-      this.qualityElement.style.color = colors[quality] || 'white';
-    }
+    this.statusElement.textContent = status;
   }
   
   async startTranslation() {
@@ -927,24 +597,15 @@ class TrueToneYouTube {
     try {
       this.isTranslating = true;
       this.showUI();
-      this.updateStatus('Connecting...');
+      this.updateStatus('Starting...');
       
       // Connect to backend
-      await this.audioCaptureManager.connectToBackend();
-      this.updateStatus('Initializing...');
+      await this.connectToBackend();
       
       // Start audio capture
-      const success = await this.audioCaptureManager.initializeAudioCapture(this.config);
+      await this.startAudioCapture();
       
-      if (success) {
-        this.updateStatus('Translating');
-        this.toggleButton.textContent = 'Stop Translation';
-        
-        // Start quality monitoring
-        this.startQualityMonitoring();
-      } else {
-        throw new Error('Failed to initialize audio capture');
-      }
+      this.updateStatus('Translating');
       
     } catch (error) {
       console.error('Error starting translation:', error);
@@ -952,60 +613,116 @@ class TrueToneYouTube {
       this.stopTranslation();
     }
   }
-
-  startQualityMonitoring() {
-    // Monitor audio quality every 2 seconds
-    this.qualityMonitorInterval = setInterval(() => {
-      const stats = this.audioCaptureManager.getAudioStats();
-      
-      if (stats.isCapturing) {
-        const metrics = stats.qualityMetrics;
-        let quality = 'Good';
-        
-        if (metrics.averageLevel < 0.01) {
-          quality = 'Poor'; // Too quiet
-        } else if (metrics.peakLevel >= 0.99) {
-          quality = 'Bad'; // Clipping
-        } else if (metrics.averageLevel > 0.1) {
-          quality = 'Excellent'; // Good levels
-        }
-        
-        this.updateQuality(quality);
-        
-        // Update status based on connection
-        if (stats.websocketState === 1) { // WebSocket.OPEN
-          this.updateStatus('Translating');
-        } else {
-          this.updateStatus('Reconnecting...');
-        }
-      }
-    }, 2000);
-  }
   
   async stopTranslation() {
     console.log('Stopping translation');
     
     this.isTranslating = false;
-    
-    // Stop quality monitoring
-    if (this.qualityMonitorInterval) {
-      clearInterval(this.qualityMonitorInterval);
-      this.qualityMonitorInterval = null;
-    }
+    this.hideUI();
     
     // Stop audio capture
-    this.audioCaptureManager.stopCapture();
+    if (this.mediaStream) {
+      this.mediaStream.getTracks().forEach(track => track.stop());
+      this.mediaStream = null;
+    }
     
-    // Update UI
-    this.updateStatus('Stopped');
-    this.toggleButton.textContent = 'Start Translation';
-    this.hideUI();
+    // Close WebSocket
+    if (this.websocket) {
+      this.websocket.close();
+      this.websocket = null;
+    }
+    
+    // Close audio context
+    if (this.audioContext) {
+      this.audioContext.close();
+      this.audioContext = null;
+    }
   }
   
   async restartTranslation() {
     console.log('Restarting translation for new video');
     await this.stopTranslation();
     setTimeout(() => this.startTranslation(), 1000);
+  }
+  
+  async connectToBackend() {
+    return new Promise((resolve, reject) => {
+      this.websocket = new WebSocket('ws://localhost:8000/ws');
+      
+      this.websocket.onopen = () => {
+        console.log('Connected to TrueTone backend');
+        resolve();
+      };
+      
+      this.websocket.onmessage = (event) => {
+        console.log('Received from backend:', event.data);
+        // Handle translated audio data here
+      };
+      
+      this.websocket.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        reject(error);
+      };
+      
+      this.websocket.onclose = () => {
+        console.log('Disconnected from backend');
+      };
+    });
+  }
+  
+  async startAudioCapture() {
+    try {
+      // Get current tab's audio stream
+      const tabId = await this.getCurrentTabId();
+      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          mandatory: {
+            chromeMediaSource: 'tab',
+            chromeMediaSourceId: tabId
+          }
+        }
+      });
+      
+      // Set up audio processing
+      this.audioContext = new AudioContext();
+      const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+      
+      // Create audio processor
+      const processor = this.audioContext.createScriptProcessor(4096, 1, 1);
+      
+      processor.onaudioprocess = (event) => {
+        const inputBuffer = event.inputBuffer;
+        const inputData = inputBuffer.getChannelData(0);
+        
+        // Send audio data to backend
+        if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+          const audioData = Array.from(inputData);
+          this.websocket.send(JSON.stringify({
+            type: 'audio',
+            data: audioData,
+            sampleRate: this.audioContext.sampleRate,
+            config: this.config
+          }));
+        }
+      };
+      
+      source.connect(processor);
+      processor.connect(this.audioContext.destination);
+      
+      console.log('Audio capture started');
+      
+    } catch (error) {
+      console.error('Error starting audio capture:', error);
+      throw error;
+    }
+  }
+  
+  async getCurrentTabId() {
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage({ action: 'getCurrentTabId' }, (response) => {
+        resolve(response.tabId);
+      });
+    });
   }
 }
 

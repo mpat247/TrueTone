@@ -66,13 +66,6 @@ class AudioCaptureManager {
       this.processorNode.connect(this.audioContext.destination);
       
       this.isCapturing = true;
-      
-      // Start quality monitoring
-      this.startQualityMonitoring();
-      
-      // Start periodic synchronization
-      this.startPeriodicSync();
-      
       console.log('Audio capture initialized successfully');
       
       return true;
@@ -80,36 +73,6 @@ class AudioCaptureManager {
       console.error('Failed to initialize audio capture:', error);
       await this.handleCaptureError(error);
       return false;
-    }
-  }
-
-  startQualityMonitoring() {
-    // Monitor audio quality every 5 seconds
-    this.qualityMonitorInterval = setInterval(() => {
-      if (this.isCapturing) {
-        this.requestQualityCheck();
-      }
-    }, 5000);
-  }
-
-  startPeriodicSync() {
-    // Sync clocks every 30 seconds
-    this.syncInterval = setInterval(() => {
-      if (this.isCapturing && this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-        this.requestClockSync();
-      }
-    }, 30000);
-  }
-
-  stopQualityMonitoring() {
-    if (this.qualityMonitorInterval) {
-      clearInterval(this.qualityMonitorInterval);
-      this.qualityMonitorInterval = null;
-    }
-    
-    if (this.syncInterval) {
-      clearInterval(this.syncInterval);
-      this.syncInterval = null;
     }
   }
 
@@ -200,41 +163,25 @@ class AudioCaptureManager {
     if (this.audioBuffer.length === 0 || !this.websocket) return;
     
     try {
-      // Convert audio buffer to Float32Array for proper encoding
-      const audioFloat32 = new Float32Array(this.audioBuffer);
-      
-      // Convert to base64 for transmission
-      const audioBytes = new Uint8Array(audioFloat32.buffer);
-      const base64Audio = btoa(String.fromCharCode.apply(null, audioBytes));
-      
-      // Create audio chunk data matching backend protocol
+      // Create audio chunk data
       const chunkData = {
         type: 'audio_chunk',
         sequence: this.sequenceNumber++,
         timestamp: Date.now(),
         sampleRate: this.sampleRate,
         channels: 1,
-        data: base64Audio, // Base64 encoded audio data
-        metadata: {
-          bufferSize: this.audioBuffer.length,
-          quality: {
-            averageLevel: this.audioQualityMetrics.averageLevel,
-            peakLevel: this.audioQualityMetrics.peakLevel,
-            hasClipping: this.audioQualityMetrics.clipCount > 0,
-            isSilent: this.audioQualityMetrics.silenceCount > this.bufferSize * 0.9,
-            snrEstimate: this.calculateSNR()
-          },
-          compression: {
-            enabled: true,
-            preferredAlgorithm: 'lz4' // Fast compression for real-time
-          }
+        data: this.audioBuffer.slice(), // Copy buffer
+        quality: {
+          averageLevel: this.audioQualityMetrics.averageLevel,
+          peakLevel: this.audioQualityMetrics.peakLevel,
+          hasClipping: this.audioQualityMetrics.clipCount > 0,
+          isSilent: this.audioQualityMetrics.silenceCount > this.bufferSize * 0.9
         }
       };
       
       // Send via WebSocket
       if (this.websocket.readyState === WebSocket.OPEN) {
         this.websocket.send(JSON.stringify(chunkData));
-        console.debug(`Sent audio chunk: ${this.audioBuffer.length} samples, sequence ${chunkData.sequence}`);
       }
       
       // Clear buffer and reset metrics
@@ -247,20 +194,6 @@ class AudioCaptureManager {
       console.error('Error sending audio chunk:', error);
       this.handleStreamingError(error);
     }
-  }
-
-  calculateSNR() {
-    if (this.audioBuffer.length === 0) return 0;
-    
-    // Calculate signal power (RMS)
-    const signalPower = this.audioBuffer.reduce((sum, sample) => sum + sample * sample, 0) / this.audioBuffer.length;
-    
-    // Estimate noise floor (10th percentile of squared samples)
-    const sortedSquared = this.audioBuffer.map(s => s * s).sort((a, b) => a - b);
-    const noiseFloor = sortedSquared[Math.floor(sortedSquared.length * 0.1)] || 1e-10;
-    
-    // Calculate SNR in dB
-    return 10 * Math.log10(signalPower / noiseFloor);
   }
 
   async handleCaptureError(error) {
@@ -346,13 +279,6 @@ class AudioCaptureManager {
         this.websocket.onopen = () => {
           console.log('Connected to TrueTone backend');
           this.reconnectAttempts = 0;
-          
-          // Send initial configuration
-          this.sendAudioConfig();
-          
-          // Request clock synchronization
-          this.requestClockSync();
-          
           resolve();
         };
         
@@ -383,213 +309,22 @@ class AudioCaptureManager {
     });
   }
 
-  sendAudioConfig() {
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      const configMessage = {
-        type: 'audio_config',
-        config: {
-          action: 'start',
-          sampleRate: this.sampleRate,
-          channels: 1,
-          bufferSize: this.bufferSize,
-          format: 'float32',
-          compression: {
-            enabled: true,
-            preferredAlgorithm: 'lz4'
-          }
-        }
-      };
-      
-      this.websocket.send(JSON.stringify(configMessage));
-      console.log('Sent audio configuration to backend');
-    }
-  }
-
-  requestClockSync() {
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      const syncMessage = {
-        type: 'sync_request',
-        client_time: Date.now() / 1000 // Convert to seconds
-      };
-      
-      this.websocket.send(JSON.stringify(syncMessage));
-      console.log('Requested clock synchronization');
-    }
-  }
-
-  requestQualityCheck() {
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      const qualityMessage = {
-        type: 'quality_check',
-        timestamp: Date.now()
-      };
-      
-      this.websocket.send(JSON.stringify(qualityMessage));
-    }
-  }
-
-  requestStats() {
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      const statsMessage = {
-        type: 'stats_request',
-        stats_type: 'all',
-        timestamp: Date.now()
-      };
-      
-      this.websocket.send(JSON.stringify(statsMessage));
-    }
-  }
-
   handleBackendMessage(data) {
     switch (data.type) {
-      case 'connection_established':
-        console.log('Backend connection established:', data);
-        this.serverTimeOffset = data.server_time - (Date.now() / 1000);
-        break;
-        
-      case 'audio_chunk_processed':
-        console.debug('Audio chunk processed:', data.sequence, data.status);
-        if (data.buffer_stats) {
-          this.handleBufferStats(data.buffer_stats);
-        }
-        break;
-        
-      case 'audio_config_response':
-        console.log('Audio config response:', data.status);
-        if (data.status === 'started') {
-          console.log('Backend audio capture started successfully');
-        }
-        break;
-        
-      case 'sync_response':
-        console.log('Clock sync response:', data);
-        this.serverTimeOffset = data.server_time - data.client_time;
-        console.log(`Clock sync: offset = ${this.serverTimeOffset}s, jitter = ${data.jitter_estimate}ms`);
-        break;
-        
-      case 'quality_check_response':
-        console.log('Quality check response:', data);
-        this.handleQualityRecommendations(data);
-        break;
-        
-      case 'stats_response':
-        console.log('Stats response:', data);
-        this.handleStatsUpdate(data);
-        break;
-        
       case 'translated_audio':
         this.playTranslatedAudio(data);
         break;
-        
-      case 'stream_control_response':
-        console.log('Stream control response:', data.command, data.status);
+      case 'status_update':
+        console.log('Backend status:', data.status);
         break;
-        
       case 'error':
         console.error('Backend error:', data.message);
-        this.handleBackendError(data);
         break;
-        
+      case 'quality_feedback':
+        this.adjustQualitySettings(data);
+        break;
       default:
-        console.log('Unknown message type:', data.type, data);
-    }
-  }
-
-  handleBufferStats(bufferStats) {
-    // Monitor buffer health
-    if (bufferStats.utilization > 80) {
-      console.warn('Backend buffer utilization high:', bufferStats.utilization + '%');
-      // Could reduce chunk size or increase send frequency
-    }
-    
-    if (bufferStats.overflow_count > 0) {
-      console.warn('Backend buffer overflow detected:', bufferStats.overflow_count);
-    }
-  }
-
-  handleQualityRecommendations(qualityData) {
-    const recommendations = qualityData.recommendations || [];
-    const metrics = qualityData.quality_metrics || {};
-    
-    console.log('Audio quality metrics:', metrics);
-    
-    recommendations.forEach(recommendation => {
-      console.log('Quality recommendation:', recommendation);
-    });
-    
-    // Auto-adjust based on recommendations
-    if (recommendations.includes('Low SNR detected - consider noise reduction')) {
-      // Could implement noise gating or filtering
-      console.log('Implementing noise reduction measures');
-    }
-    
-    if (recommendations.includes('Audio clipping detected - reduce input level')) {
-      // Could reduce gain or implement automatic gain control
-      console.log('Reducing audio input level');
-    }
-  }
-
-  handleStatsUpdate(statsData) {
-    if (statsData.capture_stats) {
-      console.log('Capture stats:', statsData.capture_stats);
-    }
-    
-    if (statsData.streaming_stats) {
-      console.log('Streaming stats:', statsData.streaming_stats);
-      
-      // Monitor network quality
-      const networkStats = statsData.streaming_stats;
-      if (networkStats.packet_loss_rate > 0.05) {
-        console.warn('High packet loss detected:', networkStats.packet_loss_rate);
-        this.adaptToNetworkConditions(networkStats);
-      }
-      
-      if (networkStats.average_latency > 300) {
-        console.warn('High latency detected:', networkStats.average_latency + 'ms');
-        this.adaptToNetworkConditions(networkStats);
-      }
-    }
-  }
-
-  adaptToNetworkConditions(networkStats) {
-    // Reduce buffer size for poor network conditions
-    if (networkStats.packet_loss_rate > 0.05 || networkStats.average_latency > 300) {
-      const newBufferSize = Math.max(1024, Math.floor(this.bufferSize * 0.8));
-      if (newBufferSize !== this.bufferSize) {
-        console.log(`Adapting buffer size: ${this.bufferSize} -> ${newBufferSize}`);
-        this.bufferSize = newBufferSize;
-        this.recreateProcessorNode();
-      }
-    }
-  }
-
-  recreateProcessorNode() {
-    if (this.processorNode && this.sourceNode && this.audioContext) {
-      // Disconnect old processor
-      this.processorNode.disconnect();
-      
-      // Create new processor with updated buffer size
-      this.processorNode = this.audioContext.createScriptProcessor(this.bufferSize, 1, 1);
-      this.processorNode.onaudioprocess = this.processAudioData.bind(this);
-      
-      // Reconnect
-      this.sourceNode.connect(this.processorNode);
-      this.processorNode.connect(this.audioContext.destination);
-      
-      console.log('Recreated processor node with buffer size:', this.bufferSize);
-    }
-  }
-
-  handleBackendError(errorData) {
-    console.error('Backend error:', errorData.message);
-    
-    // Handle specific error types
-    if (errorData.message.includes('Audio chunk processing error')) {
-      console.log('Attempting to resend audio configuration');
-      this.sendAudioConfig();
-    } else if (errorData.message.includes('decompression')) {
-      console.log('Disabling compression due to backend error');
-      // Could disable compression in next chunks
+        console.log('Unknown message type:', data.type);
     }
   }
 
@@ -620,9 +355,6 @@ class AudioCaptureManager {
     
     this.isCapturing = false;
     
-    // Stop monitoring
-    this.stopQualityMonitoring();
-    
     // Clean up audio nodes
     if (this.processorNode) {
       this.processorNode.disconnect();
@@ -644,14 +376,6 @@ class AudioCaptureManager {
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach(track => track.stop());
       this.mediaStream = null;
-    }
-    
-    // Send stop command to backend
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      this.websocket.send(JSON.stringify({
-        type: 'audio_config',
-        config: { action: 'stop' }
-      }));
     }
     
     // Close WebSocket

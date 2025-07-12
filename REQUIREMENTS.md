@@ -1,9 +1,11 @@
 # TrueTone Requirements Specification
 
 ## 📄 Project Overview
+
 TrueTone is a Chrome extension + Python backend system that enables real-time translation of YouTube videos into a user-selected target language, while preserving the original speaker's voice characteristics (pitch, tone, rhythm).
 
 ## 🎯 Objectives
+
 - Capture YouTube audio in real-time from any open tab
 - Transcribe speech to text using Whisper (locally or via server)
 - Translate transcribed text to target language using HuggingFace models
@@ -13,6 +15,7 @@ TrueTone is a Chrome extension + Python backend system that enables real-time tr
 ## 🧩 System Components
 
 ### 3.1 Chrome Extension (Frontend)
+
 - Injects into YouTube tabs
 - Captures tab audio (Web Audio API)
 - Provides UI to:
@@ -23,20 +26,21 @@ TrueTone is a Chrome extension + Python backend system that enables real-time tr
 - Sends audio to backend via WebSocket or REST
 
 ### 3.2 Python Backend (FastAPI)
+
 - Receives audio stream
-- Runs transcription (Whisper or whisper.cpp)
+- Runs transcription (Whisper)
 - Translates text using HuggingFace models
-- Runs speaker embedding (Resemblyzer)
-- Synthesizes translated speech (Coqui TTS + voice clone)
+- Performs voice cloning
+- Synthesizes translated speech (TTS-Mozilla + voice clone)
 - Streams audio back to extension
 
 ### 3.3 ML Models
-| Task | Model | Tool |
-|------|-------|------|
-| Transcription | Whisper (base/medium) | `whisper` or `whisper.cpp` |
-| Translation | mBART, NLLB, M2M100 | `transformers` |
-| Voice Embedding | Resemblyzer | `resemblyzer` |
-| TTS | Coqui TTS | `TTS` library (multi-speaker support) |
+
+| Task          | Model                 | Tool                                            |
+| ------------- | --------------------- | ----------------------------------------------- |
+| Transcription | Whisper (base/medium) | `whisper`                                       |
+| Translation   | mBART, NLLB, M2M100   | `transformers`                                  |
+| TTS           | Under evaluation      | TBD (evaluating Python 3.12 compatible options) |
 
 ## 📐 Architecture Flow
 
@@ -50,8 +54,7 @@ TrueTone is a Chrome extension + Python backend system that enables real-time tr
 [FastAPI Backend]
    ├─> Transcribe (Whisper)
    ├─> Translate (HuggingFace)
-   ├─> Voice Embedding (Resemblyzer)
-   ├─> TTS Synthesis (Coqui)
+   ├─> Voice Cloning & TTS (TTS-Mozilla)
    └─> Stream translated audio back
 
 [Chrome Extension]
@@ -61,31 +64,39 @@ TrueTone is a Chrome extension + Python backend system that enables real-time tr
 ## ⚙️ Functional Requirements
 
 ### 5.1 Audio Capture
+
 - Real-time tab audio capture
 - Compatible with YouTube player
 - Adjustable buffer size (e.g., 2–5 seconds)
 
 ### 5.2 Transcription
+
 - Segment audio stream into chunks
 - Use Whisper for accurate, multilingual transcription
 - Output timestamps for each segment
 
 ### 5.3 Translation
+
 - Use transformer-based models
 - Maintain formatting and casing
 - Match translated segment duration to original
 
 ### 5.4 Voice Cloning + TTS
-- Extract speaker embedding from original speech
-- Use cloned voice to synthesize translated speech
+
+- Extract voice characteristics from original speech
+- Implement voice cloning for natural-sounding translation
 - Output must sync closely with video timeline
+- TTS solution must support Python 3.12
+- Support for cross-lingual voice preservation
 
 ### 5.5 Playback and UI
+
 - Overlay translated audio
 - Let user toggle between original/translated audio
 - Sync translated audio to video using timestamps
 
 ## 🔒 Non-Functional Requirements
+
 - Low latency: end-to-end lag < 3s for smooth UX
 - Cross-browser support (Chrome; future: Firefox)
 - Works offline if all models are bundled (future goal)
@@ -93,24 +104,45 @@ TrueTone is a Chrome extension + Python backend system that enables real-time tr
 - Maintain original voice quality above 85% similarity
 
 ## 🧪 Testing Plan
-| Component | Test Type | Metric |
-|-----------|-----------|--------|
-| Audio Capture | Functional | Latency, buffering errors |
-| Transcription | Accuracy Test | WER (Word Error Rate) |
-| Translation | BLEU / Quality | Language correctness |
-| Voice Cloning | Similarity | Cosine similarity of embeddings |
-| Playback Sync | Integration | Audio/video drift tolerance < 1s |
+
+| Component     | Test Type      | Metric                           |
+| ------------- | -------------- | -------------------------------- |
+| Audio Capture | Functional     | Latency, buffering errors        |
+| Transcription | Accuracy Test  | WER (Word Error Rate)            |
+| Translation   | BLEU / Quality | Language correctness             |
+| Voice Cloning | Similarity     | Perceived voice similarity       |
+| Playback Sync | Integration    | Audio/video drift tolerance < 1s |
 
 ## 📁 Dependencies
-- `fastapi`, `uvicorn`
-- `whisper` or `whisper.cpp`
+
+The following dependencies are required and specified in requirements.txt:
+
+### Core Backend
+
+- `fastapi`, `uvicorn`, `websockets`
+- `python-multipart`, `python-dotenv`, `pydantic`
+
+### Audio Processing
+
+- `numpy`, `soundfile`, `librosa`, `resampy`
+- `webrtcvad`, `ffmpeg-python`
+
+### ML Models
+
+- `torch`, `torchaudio`
 - `transformers`, `sentencepiece`
-- `resampy`, `resemblyzer`
-- `TTS` (Coqui)
-- `pyaudio`, `ffmpeg`
-- Chrome Extension APIs (Manifest v3)
+- `openai-whisper`
+
+### Voice Synthesis
+
+- TBD (evaluating options for Python 3.12 compatibility)
+
+### Optional Dependencies
+
+- `pyaudio` (for microphone input if needed)
 
 ## 🔄 Future Enhancements
+
 - Subtitle generation with original + translated captions
 - Support for multi-speaker separation
 - Integration with Twitch, Vimeo, or custom HTML5 players
@@ -118,14 +150,15 @@ TrueTone is a Chrome extension + Python backend system that enables real-time tr
 - i18n UI for global users
 
 ## 🔚 Deliverables
+
 - Chrome extension (`.zip` or GitHub repo)
 - FastAPI backend service (`main.py`)
+- Voice synthesis module (`tts_mozilla_synthesis.py`)
 - Preconfigured models and sample audio
-- Usage guide and README.md
+- Usage guide and comprehensive documentation
 
 ---
 
-**Author**: Manav Patel  
 **Project**: TrueTone  
-**Version**: v1.0  
-**Last Updated**: July 4, 2025
+**Version**: v1.0.5  
+**Last Updated**: July 6, 2025

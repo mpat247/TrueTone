@@ -1,406 +1,514 @@
-#!/usr/bin/env python3
 """
-Audio Pipeline Service
-Orchestrates the complete audio processing workflow from capture to output.
+Audio Pipeline Service for TrueTone
+Integrates audio processing with the streaming pipeline for optimized ML processing.
 """
 
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional, Any, Callable
-import json
+from typing import Dict, Any, Optional, List, Tuple, Callable
+from dataclasses import dataclass, asdict
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import queue
 
-from models.audio_metadata import AudioMetadata, AudioChunk, AudioFormat, ProcessingStats
-from services.audio_capture import AudioCaptureService
-from services.audio_streaming import AudioStreamingService
-from utils.audio_processing import AudioProcessor
-from utils.audio_compression import AudioCompressor
+from .audio_capture import AudioCaptureManager
+from .audio_streaming import AudioStreamingManager
+from ..utils.audio_processing import AudioProcessor, AudioMetadata
 
 logger = logging.getLogger(__name__)
 
-class AudioPipelineService:
+@dataclass
+class PipelineConfig:
+    """Configuration for audio pipeline processing"""
+    # Audio processing settings
+    target_sample_rate: int = 16000  # Optimal for Whisper
+    chunk_duration: float = 1.0      # Duration per processing chunk (seconds)
+    overlap_duration: float = 0.1    # Overlap between chunks (seconds)
+    max_buffer_size: int = 50        # Maximum number of chunks to buffer
+    
+    # Quality settings
+    normalize_audio: bool = True
+    apply_filtering: bool = True
+    quality_threshold: float = 0.3   # Minimum quality score to process
+    
+    # Processing settings
+    async_processing: bool = True
+    max_workers: int = 2             # Number of processing threads
+    processing_timeout: float = 5.0  # Max time to process a chunk
+    
+    # Pipeline optimization
+    adaptive_quality: bool = True    # Adapt processing based on quality
+    skip_silent_chunks: bool = True  # Skip chunks with low energy
+    energy_threshold: float = 0.01   # Minimum energy to process
+
+@dataclass
+class ProcessedChunk:
+    """Container for processed audio chunk with metadata"""
+    chunk_id: int
+    audio_data: np.ndarray
+    metadata: AudioMetadata
+    original_chunk_id: int
+    processing_time: float
+    timestamp: float
+    quality_adjusted: bool = False
+
+class AudioPipelineManager:
     """
-    Main audio processing pipeline that coordinates all audio services.
-    Handles the complete flow from raw audio input to processed output.
+    Manages the complete audio processing pipeline from capture to ML-ready output.
+    Integrates audio capture, streaming, and processing with quality optimization.
     """
     
-    def __init__(self, 
-                 audio_processor: AudioProcessor,
-                 audio_capture: AudioCaptureService,
-                 audio_streaming: AudioStreamingService):
-        self.audio_processor = audio_processor
-        self.audio_capture = audio_capture
-        self.audio_streaming = audio_streaming
-        self.audio_compressor = AudioCompressor()
+    def __init__(self, config: Optional[PipelineConfig] = None):
+        """
+        Initialize audio pipeline manager.
+        
+        Args:
+            config: Pipeline configuration
+        """
+        self.config = config or PipelineConfig()
+        
+        # Initialize components
+        self.audio_processor = AudioProcessor(target_sample_rate=self.config.target_sample_rate)
+        self.capture_manager = AudioCaptureManager()
+        self.streaming_manager = AudioStreamingManager()
         
         # Pipeline state
         self.is_running = False
-        self.active_sessions: Dict[str, Dict[str, Any]] = {}
-        self.processing_stats = ProcessingStats()
-        
-        # Processing callbacks
-        self.on_audio_processed: Optional[Callable] = None
-        self.on_translation_ready: Optional[Callable] = None
-        self.on_error: Optional[Callable] = None
-        
-        # Configuration
-        self.config = {
-            "enable_compression": True,
-            "compression_method": "adaptive",
-            "target_sample_rate": 44100,
-            "target_channels": 2,
-            "enable_noise_reduction": True,
-            "enable_normalization": True,
-            "chunk_size": 1024,
-            "max_sessions": 10,
-            "session_timeout": 300  # 5 minutes
+        self.processed_chunks: queue.Queue = queue.Queue(maxsize=self.config.max_buffer_size)
+        self.processing_stats = {
+            'chunks_processed': 0,
+            'chunks_skipped': 0,
+            'processing_errors': 0,
+            'quality_improvements': 0,
+            'total_processing_time': 0.0,
+            'average_chunk_time': 0.0
         }
-    
-    def update_config(self, new_config: Dict[str, Any]):
-        """Update pipeline configuration"""
-        self.config.update(new_config)
-        logger.info(f"Pipeline config updated: {new_config}")
-    
-    def get_config(self) -> Dict[str, Any]:
-        """Get current pipeline configuration"""
-        return self.config.copy()
-    
-    async def start_session(self, session_id: str, metadata: AudioMetadata) -> bool:
-        """Start a new audio processing session"""
-        if len(self.active_sessions) >= self.config["max_sessions"]:
-            logger.warning(f"Cannot start session {session_id}: max sessions reached")
-            return False
         
+        # Thread management
+        self.processing_executor = ThreadPoolExecutor(max_workers=self.config.max_workers)
+        self.pipeline_thread = None
+        self.stop_event = threading.Event()
+        
+        # Callbacks for processed audio
+        self.chunk_callbacks: List[Callable[[ProcessedChunk], None]] = []
+        
+        logger.info(f"AudioPipelineManager initialized with config: {self.config}")
+    
+    def add_chunk_callback(self, callback: Callable[[ProcessedChunk], None]):
+        """Add callback for processed chunks."""
+        self.chunk_callbacks.append(callback)
+        logger.debug(f"Added chunk callback: {callback.__name__}")
+    
+    def remove_chunk_callback(self, callback: Callable[[ProcessedChunk], None]):
+        """Remove chunk callback."""
+        if callback in self.chunk_callbacks:
+            self.chunk_callbacks.remove(callback)
+            logger.debug(f"Removed chunk callback: {callback.__name__}")
+    
+    async def start_pipeline(self, websocket_url: str = "ws://localhost:8000/ws/audio") -> bool:
+        """
+        Start the complete audio pipeline.
+        
+        Args:
+            websocket_url: WebSocket URL for streaming
+            
+        Returns:
+            True if pipeline started successfully
+        """
         try:
-            # Initialize session
-            session_data = {
-                "metadata": metadata,
-                "start_time": time.time(),
-                "last_activity": time.time(),
-                "chunks_processed": 0,
-                "total_samples": 0,
-                "processing_errors": 0,
-                "status": "active"
-            }
+            if self.is_running:
+                logger.warning("Pipeline is already running")
+                return True
             
-            # Create capture session using existing API
-            config = {
-                "sample_rate": metadata.format.sample_rate,
-                "channels": metadata.format.channels,
-                "format": metadata.format.format.lower(),
-                "buffer_size": metadata.chunk_size,
-                "target_language": metadata.language,
-                "voice_cloning": True
-            }
+            logger.info("Starting audio pipeline...")
             
-            capture_session_id = self.audio_capture.create_session(session_id, config)
-            session_data["capture_session_id"] = capture_session_id
+            # Start capture manager
+            if not await self.capture_manager.start_capture():
+                logger.error("Failed to start audio capture")
+                return False
             
-            self.active_sessions[session_id] = session_data
-            logger.info(f"Started audio pipeline session {session_id}")
+            # Start streaming manager
+            if not await self.streaming_manager.connect(websocket_url):
+                logger.error("Failed to connect streaming manager")
+                await self.capture_manager.stop_capture()
+                return False
+            
+            # Start processing pipeline
+            self.is_running = True
+            self.stop_event.clear()
+            
+            # Start pipeline thread
+            self.pipeline_thread = threading.Thread(target=self._run_pipeline_loop, daemon=True)
+            self.pipeline_thread.start()
+            
+            logger.info("Audio pipeline started successfully")
             return True
             
         except Exception as e:
-            logger.error(f"Error starting session {session_id}: {e}")
+            logger.error(f"Error starting pipeline: {e}")
+            await self.stop_pipeline()
             return False
     
-    async def stop_session(self, session_id: str) -> bool:
-        """Stop an audio processing session"""
-        if session_id not in self.active_sessions:
-            logger.warning(f"Session {session_id} not found")
-            return False
-        
+    async def stop_pipeline(self):
+        """Stop the audio pipeline."""
         try:
-            session_data = self.active_sessions[session_id]
+            if not self.is_running:
+                return
             
-            # Stop capture session using existing API
-            if "capture_session_id" in session_data:
-                self.audio_capture.close_session(session_data["capture_session_id"])
+            logger.info("Stopping audio pipeline...")
             
-            # Update stats
-            session_data["status"] = "stopped"
-            session_data["end_time"] = time.time()
+            # Signal stop
+            self.is_running = False
+            self.stop_event.set()
             
-            # Clean up session
-            del self.active_sessions[session_id]
+            # Wait for pipeline thread to finish
+            if self.pipeline_thread and self.pipeline_thread.is_alive():
+                self.pipeline_thread.join(timeout=5.0)
             
-            logger.info(f"Stopped audio pipeline session {session_id}")
-            return True
+            # Stop components
+            await self.capture_manager.stop_capture()
+            await self.streaming_manager.disconnect()
+            
+            # Shutdown thread pool
+            self.processing_executor.shutdown(wait=True, timeout=5.0)
+            
+            # Clear queues
+            while not self.processed_chunks.empty():
+                try:
+                    self.processed_chunks.get_nowait()
+                except queue.Empty:
+                    break
+            
+            logger.info("Audio pipeline stopped")
             
         except Exception as e:
-            logger.error(f"Error stopping session {session_id}: {e}")
+            logger.error(f"Error stopping pipeline: {e}")
+    
+    def _run_pipeline_loop(self):
+        """Main pipeline processing loop (runs in separate thread)."""
+        logger.info("Pipeline processing loop started")
+        
+        chunk_id = 0
+        
+        try:
+            while self.is_running and not self.stop_event.is_set():
+                try:
+                    # Get raw audio chunk from capture manager
+                    raw_chunk = self.capture_manager.get_next_chunk(timeout=0.1)
+                    
+                    if raw_chunk is None:
+                        time.sleep(0.01)  # Brief pause if no data
+                        continue
+                    
+                    # Extract audio data and metadata
+                    audio_data = raw_chunk.get('audio_data')
+                    sample_rate = raw_chunk.get('sample_rate', 44100)
+                    timestamp = raw_chunk.get('timestamp', time.time())
+                    
+                    if audio_data is None or len(audio_data) == 0:
+                        continue
+                    
+                    # Check if chunk should be skipped
+                    if self.config.skip_silent_chunks and self._is_silent_chunk(audio_data):
+                        self.processing_stats['chunks_skipped'] += 1
+                        continue
+                    
+                    # Submit for async processing
+                    if self.config.async_processing:
+                        future = self.processing_executor.submit(
+                            self._process_audio_chunk,
+                            chunk_id, audio_data, sample_rate, timestamp
+                        )
+                        
+                        # Handle future result (non-blocking)
+                        def handle_result(fut):
+                            try:
+                                processed_chunk = fut.result(timeout=self.config.processing_timeout)
+                                if processed_chunk:
+                                    self._handle_processed_chunk(processed_chunk)
+                            except Exception as e:
+                                logger.error(f"Error processing chunk {chunk_id}: {e}")
+                                self.processing_stats['processing_errors'] += 1
+                        
+                        future.add_done_callback(handle_result)
+                    else:
+                        # Synchronous processing
+                        processed_chunk = self._process_audio_chunk(
+                            chunk_id, audio_data, sample_rate, timestamp
+                        )
+                        if processed_chunk:
+                            self._handle_processed_chunk(processed_chunk)
+                    
+                    chunk_id += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error in pipeline loop: {e}")
+                    self.processing_stats['processing_errors'] += 1
+                    time.sleep(0.1)  # Brief pause on error
+        
+        except Exception as e:
+            logger.error(f"Fatal error in pipeline loop: {e}")
+        
+        finally:
+            logger.info("Pipeline processing loop ended")
+    
+    def _is_silent_chunk(self, audio_data: np.ndarray) -> bool:
+        """Check if audio chunk is silent or has very low energy."""
+        try:
+            if len(audio_data) == 0:
+                return True
+            
+            # Calculate RMS energy
+            rms_energy = np.sqrt(np.mean(audio_data ** 2))
+            
+            return rms_energy < self.config.energy_threshold
+        except:
             return False
     
-    async def process_audio_chunk(self, session_id: str, audio_data: List[float], 
-                                source_metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a single audio chunk through the complete pipeline"""
-        if session_id not in self.active_sessions:
-            raise ValueError(f"Session {session_id} not active")
+    def _process_audio_chunk(self, chunk_id: int, audio_data: np.ndarray, 
+                           sample_rate: int, timestamp: float) -> Optional[ProcessedChunk]:
+        """
+        Process a single audio chunk.
         
+        Args:
+            chunk_id: Unique chunk identifier
+            audio_data: Raw audio data
+            sample_rate: Sample rate
+            timestamp: Chunk timestamp
+            
+        Returns:
+            ProcessedChunk if processing successful, None otherwise
+        """
         start_time = time.time()
-        session_data = self.active_sessions[session_id]
         
         try:
-            # Update session activity
-            session_data["last_activity"] = time.time()
-            session_data["chunks_processed"] += 1
-            session_data["total_samples"] += len(audio_data)
-            
-            # Create audio chunk with metadata
-            metadata = session_data["metadata"]
-            metadata.timestamp = time.time()
-            metadata.chunk_size = len(audio_data)
-            metadata.source_url = source_metadata.get("url")
-            metadata.language = source_metadata.get("language", "unknown")
-            
-            chunk = AudioChunk(
-                data=audio_data,
-                metadata=metadata,
-                sequence_number=session_data["chunks_processed"]
+            # Process audio through pipeline
+            processed_audio, metadata = self.audio_processor.process_audio_chunk(
+                audio_data, 
+                sample_rate,
+                normalize=self.config.normalize_audio,
+                filter_audio=self.config.apply_filtering
             )
             
-            # Step 1: Audio format standardization
-            standardized_chunk = await self._standardize_audio(chunk)
-            
-            # Step 2: Quality analysis and enhancement
-            enhanced_chunk = await self._enhance_audio(standardized_chunk)
-            
-            # Step 3: Compression (if enabled)
-            if self.config["enable_compression"]:
-                compressed_chunk = await self._compress_audio(enhanced_chunk)
-            else:
-                compressed_chunk = enhanced_chunk
-            
-            # Step 4: Streaming preparation
-            streaming_data = await self._prepare_for_streaming(compressed_chunk)
-            
-            # Update processing stats
             processing_time = time.time() - start_time
-            self.processing_stats.update_processing_time(processing_time)
-            self.processing_stats.add_samples(len(audio_data))
             
-            # Update session metadata
-            session_data["processing_latency"] = processing_time
+            # Check quality threshold
+            quality_adjusted = False
+            if metadata.quality_score < self.config.quality_threshold:
+                if self.config.adaptive_quality:
+                    # Try alternative processing for low quality audio
+                    processed_audio, metadata = self.audio_processor.process_audio_chunk(
+                        audio_data, 
+                        sample_rate,
+                        normalize=True,
+                        filter_audio=True
+                    )
+                    quality_adjusted = True
+                else:
+                    logger.warning(f"Chunk {chunk_id} quality {metadata.quality_score:.3f} below threshold")
             
-            # Prepare response
-            response = {
-                "status": "success",
-                "session_id": session_id,
-                "chunk_sequence": chunk.sequence_number,
-                "processing_time": processing_time,
-                "original_samples": len(audio_data),
-                "processed_samples": len(compressed_chunk.data),
-                "compression_ratio": compressed_chunk.metadata.compression_ratio,
-                "quality_metrics": {
-                    "peak_amplitude": compressed_chunk.metadata.peak_amplitude,
-                    "rms_level": compressed_chunk.metadata.rms_level,
-                    "snr": compressed_chunk.metadata.signal_to_noise_ratio
-                },
-                "streaming_data": streaming_data
-            }
-            
-            # Call processing callback if set
-            if self.on_audio_processed:
-                await self.on_audio_processed(session_id, compressed_chunk, response)
-            
-            return response
-            
-        except Exception as e:
-            session_data["processing_errors"] += 1
-            self.processing_stats.add_error()
-            logger.error(f"Error processing audio chunk for session {session_id}: {e}")
-            
-            # Call error callback if set
-            if self.on_error:
-                await self.on_error(session_id, e)
-            
-            raise
-    
-    async def _standardize_audio(self, chunk: AudioChunk) -> AudioChunk:
-        """Standardize audio format and quality"""
-        try:
-            # Convert to numpy array for processing
-            audio_np = np.array(chunk.data, dtype=np.float32)
-            
-            # Standardize format using existing API
-            processed_audio = self.audio_processor.standardize_audio(
-                audio_np,
-                orig_sample_rate=chunk.metadata.format.sample_rate,
-                target_sample_rate=self.config["target_sample_rate"]
+            # Create processed chunk
+            processed_chunk = ProcessedChunk(
+                chunk_id=chunk_id,
+                audio_data=processed_audio,
+                metadata=metadata,
+                original_chunk_id=chunk_id,
+                processing_time=processing_time,
+                timestamp=timestamp,
+                quality_adjusted=quality_adjusted
             )
             
-            # Convert stereo to mono if needed
-            if chunk.metadata.format.channels == 2 and self.config["target_channels"] == 1:
-                processed_audio = self.audio_processor.stereo_to_mono(processed_audio)
-            
-            # Update metadata
-            chunk.data = processed_audio.tolist()
-            chunk.metadata.format.sample_rate = self.config["target_sample_rate"]
-            chunk.metadata.format.channels = self.config["target_channels"]
-            
-            return chunk
-            
-        except Exception as e:
-            logger.error(f"Error standardizing audio: {e}")
-            raise
-    
-    async def _enhance_audio(self, chunk: AudioChunk) -> AudioChunk:
-        """Enhance audio quality with noise reduction and normalization"""
-        try:
-            audio_np = np.array(chunk.data, dtype=np.float32)
-            
-            # Apply basic filters for noise reduction if enabled
-            if self.config["enable_noise_reduction"]:
-                audio_np = self.audio_processor.apply_basic_filters(
-                    audio_np, 
-                    chunk.metadata.format.sample_rate
-                )
-            
-            # Apply normalization if enabled
-            if self.config["enable_normalization"]:
-                audio_np = self.audio_processor.normalize_audio(audio_np)
-            
-            # Calculate quality metrics
-            chunk.metadata.peak_amplitude = float(np.max(np.abs(audio_np)))
-            chunk.metadata.rms_level = float(np.sqrt(np.mean(audio_np**2)))
-            
-            # Simple SNR estimation (placeholder)
-            signal_power = np.mean(audio_np**2)
-            noise_power = np.mean(audio_np[:100]**2)  # Estimate from first 100 samples
-            chunk.metadata.signal_to_noise_ratio = float(10 * np.log10(signal_power / (noise_power + 1e-10)))
-            
-            chunk.data = audio_np.tolist()
-            return chunk
-            
-        except Exception as e:
-            logger.error(f"Error enhancing audio: {e}")
-            raise
-    
-    async def _compress_audio(self, chunk: AudioChunk) -> AudioChunk:
-        """Compress audio data for efficient transmission"""
-        try:
-            # Convert to numpy array for compression
-            audio_np = np.array(chunk.data, dtype=np.float32)
-            
-            # Use existing compression API
-            compressed_data, compression_metadata = self.audio_compressor.compress_audio(
-                audio_np, 
-                method=self.config["compression_method"]
+            # Update statistics
+            self.processing_stats['chunks_processed'] += 1
+            self.processing_stats['total_processing_time'] += processing_time
+            self.processing_stats['average_chunk_time'] = (
+                self.processing_stats['total_processing_time'] / 
+                max(self.processing_stats['chunks_processed'], 1)
             )
             
-            # Calculate compression ratio
-            compression_ratio = compression_metadata.get("compression_ratio", 1.0)
-            chunk.metadata.compression_ratio = compression_ratio
+            if quality_adjusted:
+                self.processing_stats['quality_improvements'] += 1
             
-            # For streaming, we'll keep the original data but store compression info
-            # In a real implementation, you'd store the compressed data separately
-            chunk.data = audio_np.tolist()
+            logger.debug(f"Processed chunk {chunk_id}: "
+                        f"{len(processed_audio)} samples, "
+                        f"quality {metadata.quality_score:.3f}, "
+                        f"time {processing_time:.3f}s")
             
-            # Update compression stats
-            self.processing_stats.add_compression_stats(compression_ratio)
-            
-            return chunk
+            return processed_chunk
             
         except Exception as e:
-            logger.error(f"Error compressing audio: {e}")
-            raise
-    
-    async def _prepare_for_streaming(self, chunk: AudioChunk) -> Dict[str, Any]:
-        """Prepare audio chunk for streaming"""
-        try:
-            # Prepare streaming data
-            streaming_data = {
-                "audio_data": chunk.data,
-                "metadata": chunk.metadata.to_dict(),
-                "sequence": chunk.sequence_number,
-                "timestamp": chunk.timestamp,
-                "format": {
-                    "sample_rate": chunk.metadata.format.sample_rate,
-                    "channels": chunk.metadata.format.channels,
-                    "bit_depth": chunk.metadata.format.bit_depth
-                }
-            }
-            
-            return streaming_data
-            
-        except Exception as e:
-            logger.error(f"Error preparing for streaming: {e}")
-            raise
-    
-    async def cleanup_inactive_sessions(self):
-        """Clean up inactive sessions that have timed out"""
-        current_time = time.time()
-        timeout = self.config["session_timeout"]
-        
-        inactive_sessions = []
-        for session_id, session_data in self.active_sessions.items():
-            if current_time - session_data["last_activity"] > timeout:
-                inactive_sessions.append(session_id)
-        
-        for session_id in inactive_sessions:
-            logger.info(f"Cleaning up inactive session {session_id}")
-            await self.stop_session(session_id)
-    
-    def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get information about a specific session"""
-        if session_id not in self.active_sessions:
+            logger.error(f"Error processing chunk {chunk_id}: {e}")
+            self.processing_stats['processing_errors'] += 1
             return None
-        
-        session_data = self.active_sessions[session_id]
-        return {
-            "session_id": session_id,
-            "status": session_data["status"],
-            "start_time": session_data["start_time"],
-            "last_activity": session_data["last_activity"],
-            "chunks_processed": session_data["chunks_processed"],
-            "total_samples": session_data["total_samples"],
-            "processing_errors": session_data["processing_errors"],
-            "uptime": time.time() - session_data["start_time"]
-        }
     
-    def get_all_sessions_info(self) -> List[Dict[str, Any]]:
-        """Get information about all active sessions"""
-        result = []
-        for session_id in self.active_sessions.keys():
-            session_info = self.get_session_info(session_id)
-            if session_info is not None:
-                result.append(session_info)
-        return result
-    
-    def get_processing_stats(self) -> Dict[str, Any]:
-        """Get overall processing statistics"""
-        return {
-            "pipeline_stats": self.processing_stats.to_dict(),
-            "active_sessions": len(self.active_sessions),
-            "config": self.config
-        }
-    
-    async def start_background_tasks(self):
-        """Start background maintenance tasks"""
-        self.is_running = True
-        
-        # Start session cleanup task
-        asyncio.create_task(self._session_cleanup_task())
-        
-        logger.info("Audio pipeline background tasks started")
-    
-    async def stop_background_tasks(self):
-        """Stop background maintenance tasks"""
-        self.is_running = False
-        
-        # Stop all active sessions
-        for session_id in list(self.active_sessions.keys()):
-            await self.stop_session(session_id)
-        
-        logger.info("Audio pipeline background tasks stopped")
-    
-    async def _session_cleanup_task(self):
-        """Background task to clean up inactive sessions"""
-        while self.is_running:
+    def _handle_processed_chunk(self, processed_chunk: ProcessedChunk):
+        """Handle a successfully processed chunk."""
+        try:
+            # Add to processed chunks queue
             try:
-                await self.cleanup_inactive_sessions()
-                await asyncio.sleep(30)  # Check every 30 seconds
-            except Exception as e:
-                logger.error(f"Error in session cleanup task: {e}")
-                await asyncio.sleep(60)  # Wait longer on error
+                self.processed_chunks.put(processed_chunk, block=False)
+            except queue.Full:
+                # Remove oldest chunk if queue is full
+                try:
+                    self.processed_chunks.get_nowait()
+                    self.processed_chunks.put(processed_chunk, block=False)
+                    logger.warning("Processed chunk queue full, removed oldest chunk")
+                except queue.Empty:
+                    pass
+            
+            # Send to streaming manager for transmission
+            asyncio.create_task(self._send_processed_chunk(processed_chunk))
+            
+            # Call registered callbacks
+            for callback in self.chunk_callbacks:
+                try:
+                    callback(processed_chunk)
+                except Exception as e:
+                    logger.error(f"Error in chunk callback {callback.__name__}: {e}")
+        
+        except Exception as e:
+            logger.error(f"Error handling processed chunk: {e}")
+    
+    async def _send_processed_chunk(self, processed_chunk: ProcessedChunk):
+        """Send processed chunk via streaming manager."""
+        try:
+            # Prepare chunk data for transmission
+            chunk_data = {
+                'chunk_id': processed_chunk.chunk_id,
+                'audio_data': processed_chunk.audio_data.tobytes(),
+                'sample_rate': processed_chunk.metadata.sample_rate,
+                'channels': processed_chunk.metadata.channels,
+                'timestamp': processed_chunk.timestamp,
+                'quality_score': processed_chunk.metadata.quality_score,
+                'processing_time': processed_chunk.processing_time
+            }
+            
+            # Send via streaming manager
+            await self.streaming_manager.send_audio_chunk(chunk_data)
+            
+        except Exception as e:
+            logger.error(f"Error sending processed chunk: {e}")
+    
+    def get_next_processed_chunk(self, timeout: float = 1.0) -> Optional[ProcessedChunk]:
+        """
+        Get next processed chunk from queue.
+        
+        Args:
+            timeout: Maximum time to wait for chunk
+            
+        Returns:
+            ProcessedChunk if available, None if timeout
+        """
+        try:
+            return self.processed_chunks.get(timeout=timeout)
+        except queue.Empty:
+            return None
+    
+    def get_pipeline_stats(self) -> Dict[str, Any]:
+        """Get comprehensive pipeline statistics."""
+        stats = self.processing_stats.copy()
+        
+        # Add component stats
+        stats.update({
+            'capture_stats': self.capture_manager.get_capture_stats(),
+            'streaming_stats': self.streaming_manager.get_streaming_stats(),
+            'processing_queue_size': self.processed_chunks.qsize(),
+            'is_running': self.is_running,
+            'config': asdict(self.config)
+        })
+        
+        return stats
+    
+    def update_config(self, **kwargs):
+        """Update pipeline configuration dynamically."""
+        for key, value in kwargs.items():
+            if hasattr(self.config, key):
+                setattr(self.config, key, value)
+                logger.info(f"Updated config {key} = {value}")
+            else:
+                logger.warning(f"Unknown config parameter: {key}")
+    
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self.stop_pipeline()
+
+# Utility functions for pipeline management
+
+async def create_pipeline(config: Optional[PipelineConfig] = None, 
+                         websocket_url: str = "ws://localhost:8000/ws/audio") -> AudioPipelineManager:
+    """
+    Create and start an audio pipeline.
+    
+    Args:
+        config: Pipeline configuration
+        websocket_url: WebSocket URL for streaming
+        
+    Returns:
+        Started AudioPipelineManager
+    """
+    pipeline = AudioPipelineManager(config)
+    
+    if await pipeline.start_pipeline(websocket_url):
+        return pipeline
+    else:
+        raise RuntimeError("Failed to start audio pipeline")
+
+def create_default_config(target_sample_rate: int = 16000, 
+                         chunk_duration: float = 1.0) -> PipelineConfig:
+    """Create default pipeline configuration."""
+    return PipelineConfig(
+        target_sample_rate=target_sample_rate,
+        chunk_duration=chunk_duration,
+        overlap_duration=0.1,
+        max_buffer_size=50,
+        normalize_audio=True,
+        apply_filtering=True,
+        quality_threshold=0.3,
+        async_processing=True,
+        max_workers=2,
+        processing_timeout=5.0,
+        adaptive_quality=True,
+        skip_silent_chunks=True,
+        energy_threshold=0.01
+    )
+
+if __name__ == "__main__":
+    # Example usage
+    import asyncio
+    
+    async def main():
+        logging.basicConfig(level=logging.INFO)
+        
+        # Create pipeline with default config
+        config = create_default_config()
+        
+        # Create and start pipeline
+        async with AudioPipelineManager(config) as pipeline:
+            # Add a simple callback to log processed chunks
+            def log_chunk(chunk: ProcessedChunk):
+                print(f"Processed chunk {chunk.chunk_id}: "
+                      f"{len(chunk.audio_data)} samples, "
+                      f"quality {chunk.metadata.quality_score:.3f}")
+            
+            pipeline.add_chunk_callback(log_chunk)
+            
+            # Start pipeline
+            if await pipeline.start_pipeline():
+                print("Pipeline started successfully")
+                
+                # Run for 10 seconds
+                await asyncio.sleep(10)
+                
+                # Print final stats
+                stats = pipeline.get_pipeline_stats()
+                print(f"Final stats: {stats}")
+            else:
+                print("Failed to start pipeline")
+    
+    asyncio.run(main())

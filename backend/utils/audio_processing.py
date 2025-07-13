@@ -1,393 +1,510 @@
 """
-Audio Processing Utilities
-Core audio processing functions for TrueTone backend.
+Audio Processing Utilities for TrueTone
+Handles audio format standardization, resampling, normalization, and conversion.
 """
 
 import numpy as np
+import soundfile as sf
+import librosa
 import logging
-from scipy import signal
-from typing import Dict, Any, Tuple, Optional
-import io
+from typing import Tuple, Optional, Dict, Any
+from dataclasses import dataclass
+from pathlib import Path
+import warnings
+
+# Suppress librosa warnings for cleaner output
+warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class AudioMetadata:
+    """Audio metadata tracking throughout pipeline"""
+    sample_rate: int
+    channels: int
+    duration: float
+    bit_depth: int
+    format: str
+    quality_score: float = 0.0
+    processing_steps: list = None
+    
+    def __post_init__(self):
+        if self.processing_steps is None:
+            self.processing_steps = []
 
 class AudioProcessor:
-    """Core audio processing utilities for standardization and format conversion"""
+    """
+    Comprehensive audio processing for TrueTone pipeline.
+    Handles format standardization, resampling, normalization, and quality control.
+    """
     
-    def __init__(self):
-        # Standard audio parameters for ML models
-        self.target_sample_rate = 16000  # 16kHz is optimal for most speech models
-        self.target_channels = 1  # Mono audio
-        self.target_dtype = np.float32
-        
-        # Audio quality thresholds
-        self.min_rms_threshold = 1e-6  # Minimum RMS to consider as valid audio
-        self.max_clip_ratio = 0.01  # Maximum acceptable clipping ratio
-        
-        logger.info(f"AudioProcessor initialized - Target: {self.target_sample_rate}Hz, {self.target_channels} channel(s)")
+    # Standard configurations for ML models
+    WHISPER_SAMPLE_RATE = 16000  # Optimal for Whisper
+    TTS_SAMPLE_RATE = 22050      # Optimal for TTS models
+    HIGH_QUALITY_SAMPLE_RATE = 44100  # For high-quality processing
     
-    def standardize_audio(self, audio_data: np.ndarray, orig_sample_rate: int, 
-                         target_sample_rate: Optional[int] = None) -> np.ndarray:
-        """Standardize audio format for ML processing"""
-        if target_sample_rate is None:
-            target_sample_rate = self.target_sample_rate
+    def __init__(self, target_sample_rate: int = WHISPER_SAMPLE_RATE):
+        """
+        Initialize audio processor with target configuration.
         
-        try:
-            # Convert to float32 if needed
-            if audio_data.dtype != self.target_dtype:
-                audio_data = audio_data.astype(self.target_dtype)
+        Args:
+            target_sample_rate: Target sample rate for processing
+        """
+        self.target_sample_rate = target_sample_rate
+        self.processing_stats = {
+            'total_processed': 0,
+            'resampling_operations': 0,
+            'normalization_operations': 0,
+            'format_conversions': 0,
+            'quality_improvements': 0
+        }
+        
+        logger.info(f"AudioProcessor initialized with target sample rate: {target_sample_rate}Hz")
+    
+    def detect_audio_properties(self, audio_data: np.ndarray, sample_rate: int) -> AudioMetadata:
+        """
+        Detect and analyze audio properties.
+        
+        Args:
+            audio_data: Raw audio data
+            sample_rate: Original sample rate
             
-            # Ensure mono (convert stereo to mono if needed)
+        Returns:
+            AudioMetadata object with detected properties
+        """
+        try:
+            # Ensure audio is 1D for analysis
             if len(audio_data.shape) > 1:
-                audio_data = self.stereo_to_mono(audio_data)
+                audio_mono = np.mean(audio_data, axis=1)
+            else:
+                audio_mono = audio_data
             
-            # Resample if sample rate doesn't match
-            if orig_sample_rate != target_sample_rate:
-                audio_data = self.resample_audio(audio_data, orig_sample_rate, target_sample_rate)
+            # Calculate basic properties
+            duration = len(audio_mono) / sample_rate
+            channels = 1 if len(audio_data.shape) == 1 else audio_data.shape[1]
             
-            # Normalize audio
-            audio_data = self.normalize_audio(audio_data)
+            # Estimate bit depth from data type
+            bit_depth_map = {
+                np.int16: 16,
+                np.int32: 24,
+                np.float32: 32,
+                np.float64: 64
+            }
+            bit_depth = bit_depth_map.get(audio_data.dtype, 16)
             
-            # Apply basic filtering
-            audio_data = self.apply_basic_filters(audio_data, target_sample_rate)
+            # Calculate quality score based on various metrics
+            quality_score = self._calculate_quality_score(audio_mono, sample_rate)
             
-            return audio_data
+            metadata = AudioMetadata(
+                sample_rate=sample_rate,
+                channels=channels,
+                duration=duration,
+                bit_depth=bit_depth,
+                format="numpy_array",
+                quality_score=quality_score
+            )
+            
+            logger.debug(f"Audio properties detected: {metadata}")
+            return metadata
             
         except Exception as e:
-            logger.error(f"Error standardizing audio: {str(e)}")
-            raise
+            logger.error(f"Error detecting audio properties: {e}")
+            # Return default metadata
+            return AudioMetadata(
+                sample_rate=sample_rate,
+                channels=1,
+                duration=0.0,
+                bit_depth=16,
+                format="unknown",
+                quality_score=0.0
+            )
     
-    def resample_audio(self, audio_data: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
-        """Resample audio to target sample rate using high-quality resampling"""
-        if orig_rate == target_rate:
-            return audio_data
+    def _calculate_quality_score(self, audio_data: np.ndarray, sample_rate: int) -> float:
+        """
+        Calculate audio quality score based on various metrics.
+        
+        Args:
+            audio_data: Mono audio data
+            sample_rate: Sample rate
+            
+        Returns:
+            Quality score between 0.0 and 1.0
+        """
+        try:
+            if len(audio_data) == 0:
+                return 0.0
+            
+            # Calculate various quality metrics
+            
+            # 1. Dynamic range (higher is better)
+            dynamic_range = np.max(audio_data) - np.min(audio_data)
+            dynamic_score = min(dynamic_range / 0.5, 1.0)  # Normalize to 0-1
+            
+            # 2. RMS energy (presence of signal)
+            rms = np.sqrt(np.mean(audio_data ** 2))
+            energy_score = min(rms / 0.1, 1.0)  # Normalize to 0-1
+            
+            # 3. Zero crossing rate (measure of spectral content)
+            zcr = librosa.feature.zero_crossing_rate(audio_data, frame_length=2048, hop_length=512)[0]
+            zcr_score = 1.0 - min(np.mean(zcr) / 0.3, 1.0)  # Lower ZCR often better for speech
+            
+            # 4. Spectral centroid (frequency content quality)
+            spectral_centroids = librosa.feature.spectral_centroid(y=audio_data, sr=sample_rate)[0]
+            centroid_score = min(np.mean(spectral_centroids) / (sample_rate / 4), 1.0)
+            
+            # 5. Sample rate score (higher sample rates generally better)
+            sr_score = min(sample_rate / 44100, 1.0)
+            
+            # Weighted combination of scores
+            quality_score = (
+                dynamic_score * 0.25 +
+                energy_score * 0.25 +
+                zcr_score * 0.2 +
+                centroid_score * 0.15 +
+                sr_score * 0.15
+            )
+            
+            return float(np.clip(quality_score, 0.0, 1.0))
+            
+        except Exception as e:
+            logger.warning(f"Error calculating quality score: {e}")
+            return 0.5  # Default moderate quality score
+    
+    def standardize_sample_rate(self, audio_data: np.ndarray, original_sr: int, 
+                              target_sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
+        """
+        Resample audio to target sample rate using high-quality algorithms.
+        
+        Args:
+            audio_data: Input audio data
+            original_sr: Original sample rate
+            target_sr: Target sample rate (uses instance default if None)
+            
+        Returns:
+            Tuple of (resampled_audio, target_sample_rate)
+        """
+        if target_sr is None:
+            target_sr = self.target_sample_rate
+        
+        if original_sr == target_sr:
+            logger.debug(f"No resampling needed, already at {target_sr}Hz")
+            return audio_data, target_sr
         
         try:
-            # Calculate resampling ratio
-            ratio = target_rate / orig_rate
+            logger.debug(f"Resampling from {original_sr}Hz to {target_sr}Hz")
             
-            # Use scipy's resample_poly for high-quality resampling
-            # This uses polyphase filtering which is better than simple interpolation
-            if ratio > 1:
-                # Upsampling
-                up_factor = int(ratio) if ratio == int(ratio) else target_rate
-                down_factor = orig_rate if ratio == int(ratio) else orig_rate
-                resampled = signal.resample_poly(audio_data, up_factor, down_factor)
-            else:
-                # Downsampling
-                down_factor = int(1/ratio) if 1/ratio == int(1/ratio) else orig_rate
-                up_factor = target_rate if 1/ratio == int(1/ratio) else target_rate
-                resampled = signal.resample_poly(audio_data, up_factor, down_factor)
+            # Use librosa's high-quality resampling with anti-aliasing
+            resampled_audio = librosa.resample(
+                audio_data, 
+                orig_sr=original_sr, 
+                target_sr=target_sr,
+                res_type='kaiser_best'  # Highest quality resampling
+            )
             
-            logger.debug(f"Resampled audio from {orig_rate}Hz to {target_rate}Hz")
-            return resampled.astype(self.target_dtype)
+            self.processing_stats['resampling_operations'] += 1
+            logger.debug(f"Resampling completed: {len(audio_data)} -> {len(resampled_audio)} samples")
+            
+            return resampled_audio, target_sr
             
         except Exception as e:
-            logger.error(f"Error resampling audio: {str(e)}")
-            # Fallback to simple resampling
-            return self._simple_resample(audio_data, orig_rate, target_rate)
+            logger.error(f"Error during resampling: {e}")
+            # Return original audio if resampling fails
+            return audio_data, original_sr
     
-    def _simple_resample(self, audio_data: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
-        """Simple resampling fallback method"""
-        ratio = target_rate / orig_rate
-        new_length = int(len(audio_data) * ratio)
+    def convert_to_mono(self, audio_data: np.ndarray) -> np.ndarray:
+        """
+        Convert stereo/multi-channel audio to mono using intelligent mixing.
         
-        # Use numpy interpolation as fallback
-        x_old = np.linspace(0, 1, len(audio_data))
-        x_new = np.linspace(0, 1, new_length)
-        resampled = np.interp(x_new, x_old, audio_data)
+        Args:
+            audio_data: Input audio data (can be mono or multi-channel)
+            
+        Returns:
+            Mono audio data
+        """
+        if len(audio_data.shape) == 1:
+            logger.debug("Audio is already mono")
+            return audio_data
         
-        logger.warning(f"Used simple resampling fallback from {orig_rate}Hz to {target_rate}Hz")
-        return resampled.astype(self.target_dtype)
-    
-    def stereo_to_mono(self, stereo_data: np.ndarray) -> np.ndarray:
-        """Convert stereo audio to mono using intelligent mixing"""
-        try:
-            if len(stereo_data.shape) == 1:
-                return stereo_data  # Already mono
-            
-            if stereo_data.shape[1] == 1:
-                return stereo_data.flatten()  # Single channel
-            
-            if stereo_data.shape[1] == 2:
-                # Standard stereo - mix channels with equal weight
-                mono = np.mean(stereo_data, axis=1)
-                return mono.astype(self.target_dtype)
-            
-            # Multi-channel audio - use first channel or mix all
-            if stereo_data.shape[1] > 2:
-                logger.warning(f"Multi-channel audio detected ({stereo_data.shape[1]} channels), mixing to mono")
-                mono = np.mean(stereo_data, axis=1)
-                return mono.astype(self.target_dtype)
-            
-            # Fallback for unexpected shapes
-            return stereo_data.flatten().astype(self.target_dtype)
-            
-        except Exception as e:
-            logger.error(f"Error converting stereo to mono: {str(e)}")
-            # Fallback - try to use first channel if possible
-            if len(stereo_data.shape) > 1 and stereo_data.shape[1] > 0:
-                return stereo_data[:, 0].astype(self.target_dtype)
+        if len(audio_data.shape) == 2:
+            if audio_data.shape[1] == 1:
+                # Single channel in 2D array
+                return audio_data.flatten()
+            elif audio_data.shape[1] == 2:
+                # Stereo to mono conversion
+                logger.debug("Converting stereo to mono")
+                mono_audio = np.mean(audio_data, axis=1)
+                return mono_audio
             else:
-                return stereo_data.flatten().astype(self.target_dtype)
+                # Multi-channel to mono
+                logger.debug(f"Converting {audio_data.shape[1]}-channel audio to mono")
+                mono_audio = np.mean(audio_data, axis=1)
+                return mono_audio
+        
+        logger.warning(f"Unexpected audio shape: {audio_data.shape}")
+        return audio_data.flatten()
     
-    def normalize_audio(self, audio_data: np.ndarray, method: str = 'peak', 
-                       target_level: float = 0.95) -> np.ndarray:
-        """Normalize audio using specified method"""
+    def normalize_audio(self, audio_data: np.ndarray, method: str = 'peak',
+                       target_level: float = 0.8) -> np.ndarray:
+        """
+        Normalize audio using various methods.
+        
+        Args:
+            audio_data: Input audio data
+            method: Normalization method ('peak', 'rms', 'lufs')
+            target_level: Target normalization level
+            
+        Returns:
+            Normalized audio data
+        """
         try:
             if len(audio_data) == 0:
                 return audio_data
             
             if method == 'peak':
                 # Peak normalization
-                peak = np.max(np.abs(audio_data))
-                if peak > 0:
-                    normalized = audio_data / peak * target_level
+                max_val = np.max(np.abs(audio_data))
+                if max_val > 0:
+                    normalized_audio = audio_data * (target_level / max_val)
                 else:
-                    normalized = audio_data
-            
+                    normalized_audio = audio_data
+                    
             elif method == 'rms':
                 # RMS normalization
                 rms = np.sqrt(np.mean(audio_data ** 2))
-                if rms > self.min_rms_threshold:
-                    target_rms = target_level * 0.3  # More conservative for RMS
-                    normalized = audio_data / rms * target_rms
+                if rms > 0:
+                    normalized_audio = audio_data * (target_level / rms)
                 else:
-                    normalized = audio_data
-            
+                    normalized_audio = audio_data
+                    
             else:
                 logger.warning(f"Unknown normalization method: {method}, using peak")
                 return self.normalize_audio(audio_data, 'peak', target_level)
             
-            # Ensure we don't exceed the target level
-            normalized = np.clip(normalized, -target_level, target_level)
+            # Prevent clipping
+            normalized_audio = np.clip(normalized_audio, -1.0, 1.0)
             
-            return normalized.astype(self.target_dtype)
+            self.processing_stats['normalization_operations'] += 1
+            logger.debug(f"Audio normalized using {method} method")
             
-        except Exception as e:
-            logger.error(f"Error normalizing audio: {str(e)}")
-            return audio_data
-    
-    def apply_basic_filters(self, audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
-        """Apply basic audio filters for preprocessing"""
-        try:
-            filtered = audio_data.copy()
-            
-            # High-pass filter to remove DC offset and low-frequency noise
-            # Cutoff at 80Hz to preserve speech fundamentals
-            filtered = self.highpass_filter(filtered, sample_rate, cutoff=80)
-            
-            # Light low-pass filter to reduce high-frequency noise
-            # Cutoff at 8kHz (Nyquist for 16kHz sampling)
-            if sample_rate > 16000:
-                filtered = self.lowpass_filter(filtered, sample_rate, cutoff=8000)
-            
-            return filtered
+            return normalized_audio
             
         except Exception as e:
-            logger.error(f"Error applying basic filters: {str(e)}")
+            logger.error(f"Error during normalization: {e}")
             return audio_data
     
-    def highpass_filter(self, audio_data: np.ndarray, sample_rate: int, 
-                       cutoff: float, order: int = 5) -> np.ndarray:
-        """Apply highpass filter"""
+    def apply_audio_filtering(self, audio_data: np.ndarray, sample_rate: int,
+                            high_pass_freq: float = 80.0,
+                            low_pass_freq: Optional[float] = None) -> np.ndarray:
+        """
+        Apply basic audio filtering to improve quality.
+        
+        Args:
+            audio_data: Input audio data
+            sample_rate: Sample rate
+            high_pass_freq: High-pass filter frequency (Hz)
+            low_pass_freq: Low-pass filter frequency (Hz), None to disable
+            
+        Returns:
+            Filtered audio data
+        """
         try:
-            nyquist = sample_rate / 2
-            normal_cutoff = cutoff / nyquist
+            filtered_audio = audio_data.copy()
             
-            if normal_cutoff >= 1.0:
-                logger.warning(f"Highpass cutoff frequency too high: {cutoff}Hz for {sample_rate}Hz sample rate")
-                return audio_data
-            
-            # Use signal.butter with proper error handling
-            filter_result = signal.butter(order, normal_cutoff, btype='high', analog=False)
-            if filter_result is None:
-                logger.warning("Failed to create highpass filter")
-                return audio_data
-            
-            # Handle different return types from signal.butter
-            if isinstance(filter_result, tuple) and len(filter_result) >= 2:
-                b, a = filter_result[0], filter_result[1]
-                filtered = signal.filtfilt(b, a, audio_data)
-                return filtered.astype(self.target_dtype)
-            else:
-                logger.warning("Unexpected filter result format")
-                return audio_data
-            
-        except Exception as e:
-            logger.error(f"Error applying highpass filter: {str(e)}")
-            return audio_data
-    
-    def lowpass_filter(self, audio_data: np.ndarray, sample_rate: int, 
-                      cutoff: float, order: int = 5) -> np.ndarray:
-        """Apply lowpass filter"""
-        try:
-            nyquist = sample_rate / 2
-            normal_cutoff = cutoff / nyquist
-            
-            if normal_cutoff >= 1.0:
-                logger.warning(f"Lowpass cutoff frequency too high: {cutoff}Hz for {sample_rate}Hz sample rate")
-                return audio_data
-            
-            # Use signal.butter with proper error handling
-            filter_result = signal.butter(order, normal_cutoff, btype='low', analog=False)
-            if filter_result is None:
-                logger.warning("Failed to create lowpass filter")
-                return audio_data
-            
-            # Handle different return types from signal.butter
-            if isinstance(filter_result, tuple) and len(filter_result) >= 2:
-                b, a = filter_result[0], filter_result[1]
-                filtered = signal.filtfilt(b, a, audio_data)
-                return filtered.astype(self.target_dtype)
-            else:
-                logger.warning("Unexpected filter result format")
-                return audio_data
-            
-        except Exception as e:
-            logger.error(f"Error applying lowpass filter: {str(e)}")
-            return audio_data
-    
-    def detect_audio_format(self, audio_data: bytes) -> Dict[str, Any]:
-        """Detect audio format from raw bytes"""
-        try:
-            # Try different format interpretations
-            formats = [
-                ('float32', np.float32),
-                ('int16', np.int16),
-                ('int32', np.int32),
-                ('float64', np.float64)
-            ]
-            
-            best_format = None
-            best_score = 0
-            
-            for format_name, dtype in formats:
-                try:
-                    # Try to interpret as this format
-                    samples = np.frombuffer(audio_data, dtype=dtype)
-                    
-                    if len(samples) == 0:
-                        continue
-                    
-                    # Convert to float32 for analysis
-                    if dtype != np.float32:
-                        if dtype == np.int16:
-                            float_samples = samples.astype(np.float32) / 32768.0
-                        elif dtype == np.int32:
-                            float_samples = samples.astype(np.float32) / 2147483648.0
-                        else:
-                            float_samples = samples.astype(np.float32)
-                    else:
-                        float_samples = samples
-                    
-                    # Score based on reasonable audio characteristics
-                    score = self._score_audio_format(float_samples)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_format = {
-                            'format': format_name,
-                            'dtype': dtype,
-                            'samples': len(samples),
-                            'score': score
-                        }
-                        
-                except Exception:
-                    continue
-            
-            if best_format:
-                logger.debug(f"Detected audio format: {best_format['format']} (score: {best_format['score']:.2f})")
-                return best_format
-            else:
-                # Default fallback
-                return {
-                    'format': 'float32',
-                    'dtype': np.float32,
-                    'samples': len(audio_data) // 4,
-                    'score': 0.0
-                }
+            # High-pass filter to remove low-frequency noise
+            if high_pass_freq > 0:
+                from scipy.signal import butter, filtfilt
+                nyquist = sample_rate / 2
+                high_pass_norm = high_pass_freq / nyquist
                 
+                if high_pass_norm < 1.0:
+                    b, a = butter(2, high_pass_norm, btype='high')
+                    filtered_audio = filtfilt(b, a, filtered_audio)
+                    logger.debug(f"Applied high-pass filter at {high_pass_freq}Hz")
+            
+            # Low-pass filter if specified
+            if low_pass_freq and low_pass_freq > 0:
+                from scipy.signal import butter, filtfilt
+                nyquist = sample_rate / 2
+                low_pass_norm = low_pass_freq / nyquist
+                
+                if low_pass_norm < 1.0:
+                    b, a = butter(2, low_pass_norm, btype='low')
+                    filtered_audio = filtfilt(b, a, filtered_audio)
+                    logger.debug(f"Applied low-pass filter at {low_pass_freq}Hz")
+            
+            return filtered_audio
+            
+        except ImportError:
+            logger.warning("scipy not available for filtering, skipping")
+            return audio_data
         except Exception as e:
-            logger.error(f"Error detecting audio format: {str(e)}")
-            return {
-                'format': 'float32',
-                'dtype': np.float32,
-                'samples': len(audio_data) // 4,
-                'score': 0.0
-            }
+            logger.warning(f"Error during filtering: {e}")
+            return audio_data
     
-    def _score_audio_format(self, audio_samples: np.ndarray) -> float:
-        """Score audio format interpretation based on characteristics"""
-        if len(audio_samples) == 0:
-            return 0.0
+    def process_audio_chunk(self, audio_data: np.ndarray, sample_rate: int,
+                          normalize: bool = True, filter_audio: bool = True) -> Tuple[np.ndarray, AudioMetadata]:
+        """
+        Complete audio processing pipeline for a single chunk.
         
-        score = 0.0
-        
-        # Check if values are in reasonable range for audio
-        max_val = np.max(np.abs(audio_samples))
-        if 0.001 <= max_val <= 1.0:
-            score += 50  # Good range for normalized audio
-        elif max_val <= 100:
-            score += 25  # Reasonable range
-        
-        # Check for reasonable dynamic range
-        if max_val > 0:
-            rms = np.sqrt(np.mean(audio_samples ** 2))
-            dynamic_range = 20 * np.log10(max_val / max(rms, 1e-6))
-            if 10 <= dynamic_range <= 60:  # Reasonable dynamic range for speech
-                score += 25
-        
-        # Check for non-zero variance (not silence or constant)
-        variance = np.var(audio_samples)
-        if variance > 1e-6:
-            score += 15
-        
-        # Check for reasonable zero crossing rate
-        if len(audio_samples) > 1:
-            zero_crossings = np.sum(np.diff(np.signbit(audio_samples)))
-            zcr = zero_crossings / (len(audio_samples) - 1)
-            if 0.01 <= zcr <= 0.3:  # Reasonable for speech
-                score += 10
-        
-        return score
-    
-    def get_audio_metadata(self, audio_data: np.ndarray, sample_rate: int) -> Dict[str, Any]:
-        """Extract metadata from audio data"""
+        Args:
+            audio_data: Raw audio data
+            sample_rate: Original sample rate
+            normalize: Whether to normalize audio
+            filter_audio: Whether to apply filtering
+            
+        Returns:
+            Tuple of (processed_audio, metadata)
+        """
         try:
-            if len(audio_data) == 0:
-                return {'error': 'Empty audio data'}
+            # Detect original properties
+            original_metadata = self.detect_audio_properties(audio_data, sample_rate)
             
-            # Basic properties
-            duration = len(audio_data) / sample_rate
-            rms = np.sqrt(np.mean(audio_data ** 2))
-            peak = np.max(np.abs(audio_data))
+            # Start processing
+            processed_audio = audio_data.copy()
+            processing_steps = ["input"]
             
-            # Dynamic range
-            dynamic_range = 20 * np.log10(peak / max(rms, 1e-6))
+            # Convert to mono if needed
+            if len(processed_audio.shape) > 1:
+                processed_audio = self.convert_to_mono(processed_audio)
+                processing_steps.append("mono_conversion")
             
-            # Zero crossing rate
-            zero_crossings = np.sum(np.diff(np.signbit(audio_data)))
-            zcr = zero_crossings / (len(audio_data) - 1) if len(audio_data) > 1 else 0
+            # Resample to target sample rate
+            processed_audio, final_sr = self.standardize_sample_rate(
+                processed_audio, sample_rate, self.target_sample_rate
+            )
+            if final_sr != sample_rate:
+                processing_steps.append(f"resampled_to_{final_sr}Hz")
             
-            # Clipping detection
-            clip_count = np.sum(np.abs(audio_data) >= 0.99)
-            clip_ratio = clip_count / len(audio_data)
+            # Apply filtering
+            if filter_audio:
+                processed_audio = self.apply_audio_filtering(processed_audio, final_sr)
+                processing_steps.append("filtered")
             
-            return {
-                'duration': duration,
-                'samples': len(audio_data),
-                'sample_rate': sample_rate,
-                'rms_level': float(rms),
-                'peak_level': float(peak),
-                'dynamic_range_db': float(dynamic_range),
-                'zero_crossing_rate': float(zcr),
-                'clipping_detected': clip_ratio > self.max_clip_ratio,
-                'clipping_ratio': float(clip_ratio),
-                'is_silence': rms < self.min_rms_threshold
-            }
+            # Normalize audio
+            if normalize:
+                processed_audio = self.normalize_audio(processed_audio, method='peak', target_level=0.8)
+                processing_steps.append("normalized")
+            
+            # Create final metadata
+            final_metadata = self.detect_audio_properties(processed_audio, final_sr)
+            final_metadata.processing_steps = processing_steps
+            
+            # Update stats
+            self.processing_stats['total_processed'] += 1
+            if final_metadata.quality_score > original_metadata.quality_score:
+                self.processing_stats['quality_improvements'] += 1
+            
+            logger.debug(f"Audio chunk processed: {len(processing_steps)} steps, "
+                        f"quality {original_metadata.quality_score:.2f} -> {final_metadata.quality_score:.2f}")
+            
+            return processed_audio, final_metadata
             
         except Exception as e:
-            logger.error(f"Error extracting audio metadata: {str(e)}")
-            return {'error': str(e)}
+            logger.error(f"Error in audio processing pipeline: {e}")
+            # Return original audio with basic metadata
+            metadata = AudioMetadata(
+                sample_rate=sample_rate,
+                channels=1,
+                duration=len(audio_data) / sample_rate,
+                bit_depth=16,
+                format="error_fallback",
+                quality_score=0.0,
+                processing_steps=["error"]
+            )
+            return audio_data, metadata
+    
+    def get_processing_stats(self) -> Dict[str, Any]:
+        """Get processing statistics."""
+        return self.processing_stats.copy()
+    
+    def reset_stats(self):
+        """Reset processing statistics."""
+        for key in self.processing_stats:
+            self.processing_stats[key] = 0
+        logger.info("Processing statistics reset")
+
+# Utility functions for common operations
+def load_audio_file(file_path: str, target_sr: int = 16000) -> Tuple[np.ndarray, int, AudioMetadata]:
+    """
+    Load audio file and return processed data with metadata.
+    
+    Args:
+        file_path: Path to audio file
+        target_sr: Target sample rate
+        
+    Returns:
+        Tuple of (audio_data, sample_rate, metadata)
+    """
+    try:
+        # Load audio file
+        audio_data, original_sr = sf.read(file_path)
+        
+        # Process with AudioProcessor
+        processor = AudioProcessor(target_sample_rate=target_sr)
+        processed_audio, metadata = processor.process_audio_chunk(audio_data, original_sr)
+        
+        logger.info(f"Audio file loaded and processed: {file_path}")
+        return processed_audio, target_sr, metadata
+        
+    except Exception as e:
+        logger.error(f"Error loading audio file {file_path}: {e}")
+        raise
+
+def save_processed_audio(audio_data: np.ndarray, sample_rate: int, 
+                        output_path: str, metadata: Optional[AudioMetadata] = None):
+    """
+    Save processed audio to file with metadata.
+    
+    Args:
+        audio_data: Processed audio data
+        sample_rate: Sample rate
+        output_path: Output file path
+        metadata: Optional metadata to include
+    """
+    try:
+        # Ensure output directory exists
+        output_dir = Path(output_path).parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save audio file
+        sf.write(output_path, audio_data, sample_rate)
+        
+        # Save metadata if provided
+        if metadata:
+            metadata_path = Path(output_path).with_suffix('.json')
+            import json
+            metadata_dict = {
+                'sample_rate': metadata.sample_rate,
+                'channels': metadata.channels,
+                'duration': metadata.duration,
+                'bit_depth': metadata.bit_depth,
+                'format': metadata.format,
+                'quality_score': metadata.quality_score,
+                'processing_steps': metadata.processing_steps
+            }
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata_dict, f, indent=2)
+        
+        logger.info(f"Processed audio saved: {output_path}")
+        
+    except Exception as e:
+        logger.error(f"Error saving processed audio: {e}")
+        raise
+
+if __name__ == "__main__":
+    # Example usage and testing
+    logging.basicConfig(level=logging.DEBUG)
+    
+    # Create test audio processor
+    processor = AudioProcessor(target_sample_rate=16000)
+    
+    # Test with synthetic audio
+    test_audio = np.random.normal(0, 0.1, 44100)  # 1 second of noise at 44.1kHz
+    
+    processed_audio, metadata = processor.process_audio_chunk(test_audio, 44100)
+    
+    print(f"Original: {len(test_audio)} samples at 44100Hz")
+    print(f"Processed: {len(processed_audio)} samples at {metadata.sample_rate}Hz")
+    print(f"Quality score: {metadata.quality_score:.3f}")
+    print(f"Processing steps: {metadata.processing_steps}")
+    print(f"Stats: {processor.get_processing_stats()}")

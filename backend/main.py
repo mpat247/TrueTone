@@ -12,11 +12,12 @@ import json
 import logging
 from typing import Dict, Any, List, Optional
 import asyncio
+import base64
 import time
-import uuid
-import os
-import io
-import numpy as np
+
+# Import our audio services
+from services.audio_capture import AudioCaptureService
+from services.audio_streaming import AudioStreamingService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +33,7 @@ from models.audio_metadata import AudioMetadata, AudioFormat, AudioChunk
 # Create FastAPI app
 app = FastAPI(
     title="TrueTone API",
-    description="Voice-preserving YouTube translation backend",
+    description="Voice-preserving YouTube translation backend with real-time audio streaming",
     version="1.0.0"
 )
 
@@ -45,48 +46,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Store active WebSocket connections
-active_connections: Dict[str, WebSocket] = {}
-
-# Initialize services
-audio_processor = None
-audio_streaming_service = None
-audio_capture_service = None
-audio_pipeline_service = None
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize services on startup"""
-    global audio_processor, audio_streaming_service, audio_capture_service, audio_pipeline_service
-    
-    # Initialize audio processing utilities
-    audio_processor = AudioProcessor()
-    
-    # Initialize services
-    audio_streaming_service = AudioStreamingService(audio_processor)
-    audio_capture_service = AudioCaptureService(audio_processor)
-    
-    # Initialize the main audio pipeline
-    audio_pipeline_service = AudioPipelineService(
-        audio_processor, 
-        audio_capture_service, 
-        audio_streaming_service
-    )
-    
-    # Start background tasks
-    await audio_pipeline_service.start_background_tasks()
-    
-    logger.info("TrueTone services initialized")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    global audio_pipeline_service
-    
-    if audio_pipeline_service:
-        await audio_pipeline_service.stop_background_tasks()
-    
-    logger.info("TrueTone services shutdown complete")
+# Store active WebSocket connections and their services
+active_connections: Dict[str, Dict[str, Any]] = {}
 
 @app.get("/")
 async def root():
@@ -94,11 +55,18 @@ async def root():
     return {
         "message": "TrueTone API is running",
         "version": "1.0.0",
+        "features": [
+            "Real-time audio capture from YouTube",
+            "Efficient audio streaming with compression",
+            "Adaptive quality management",
+            "Network condition monitoring",
+            "Audio format conversion and optimization"
+        ],
         "endpoints": {
             "health": "/health",
             "websocket": "/ws",
             "status": "/status",
-            "sessions": "/sessions"
+            "connection_stats": "/stats/{connection_id}"
         }
     }
 
@@ -110,20 +78,32 @@ async def health_check():
         "service": "TrueTone Backend",
         "version": "1.0.0",
         "timestamp": time.time(),
-        "services": {
-            "audio_processor": audio_processor is not None,
-            "audio_streaming": audio_streaming_service is not None,
-            "audio_capture": audio_capture_service is not None,
-            "audio_pipeline": audio_pipeline_service is not None
+        "active_connections": len(active_connections),
+        "services_status": {
+            "audio_capture": "ready",
+            "audio_streaming": "ready",
+            "compression": "ready"
         }
     }
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time audio streaming"""
+    """Enhanced WebSocket endpoint for real-time audio streaming"""
     await websocket.accept()
     connection_id = f"conn_{len(active_connections)}_{int(time.time())}"
-    active_connections[connection_id] = websocket
+    
+    # Initialize services for this connection
+    audio_capture = AudioCaptureService()
+    audio_streaming = AudioStreamingService()
+    
+    # Store connection and services
+    active_connections[connection_id] = {
+        'websocket': websocket,
+        'audio_capture': audio_capture,
+        'audio_streaming': audio_streaming,
+        'connected_at': time.time(),
+        'last_activity': time.time()
+    }
     
     logger.info(f"New WebSocket connection: {connection_id}")
     
@@ -132,174 +112,315 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_metadata = None
     
     try:
-        # Send welcome message
+        # Send welcome message with connection info
         await websocket.send_text(json.dumps({
-            "type": "connection",
+            "type": "connection_established",
             "message": "Connected to TrueTone backend",
-            "connection_id": connection_id
+            "connection_id": connection_id,
+            "server_time": time.time(),
+            "features": {
+                "audio_capture": True,
+                "audio_streaming": True,
+                "compression": True,
+                "quality_monitoring": True,
+                "adaptive_buffering": True
+            }
         }))
+        
+        # Set up streaming service with WebSocket
+        audio_streaming.set_websocket(websocket)
         
         while True:
             # Receive data from client
             data = await websocket.receive_text()
             message = json.loads(data)
             
-            logger.info(f"Received message type: {message.get('type')}")
+            # Update last activity
+            active_connections[connection_id]['last_activity'] = time.time()
             
-            if message.get("type") == "start_session":
-                # Start new audio processing session
-                session_id, audio_metadata = await start_audio_session(websocket, message)
-                
-            elif message.get("type") == "audio" and session_id:
-                # Process audio data
-                await process_audio_data(websocket, session_id, message)
-                
-            elif message.get("type") == "config" and session_id:
-                # Update configuration
-                await update_session_config(websocket, session_id, message)
-                
-            elif message.get("type") == "stop_session" and session_id:
-                # Stop audio processing session
-                await stop_audio_session(websocket, session_id)
-                session_id = None
-                audio_metadata = None
-                
+            message_type = message.get('type')
+            logger.debug(f"[{connection_id}] Received message type: {message_type}")
+            
+            if message_type == "audio_chunk":
+                await handle_audio_chunk(websocket, message, audio_capture, audio_streaming)
+            elif message_type == "audio_config":
+                await handle_audio_config(websocket, message, audio_capture)
+            elif message_type == "stream_control":
+                await handle_stream_control(websocket, message, audio_capture, audio_streaming)
+            elif message_type == "quality_check":
+                await handle_quality_check(websocket, message, audio_capture)
+            elif message_type == "sync_request":
+                await handle_sync_request(websocket, message, audio_streaming)
+            elif message_type == "stats_request":
+                await handle_stats_request(websocket, message, audio_capture, audio_streaming)
             else:
                 # Echo back unknown messages for debugging
                 await websocket.send_text(json.dumps({
                     "type": "echo",
                     "original": message,
-                    "note": "Unknown message type or no active session"
+                    "server_time": time.time()
                 }))
                 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {connection_id}")
-        if connection_id in active_connections:
-            del active_connections[connection_id]
-        
-        # Clean up session if active
-        if session_id and audio_pipeline_service:
-            await audio_pipeline_service.stop_session(session_id)
-            
+        await cleanup_connection(connection_id)
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        if connection_id in active_connections:
-            del active_connections[connection_id]
-        
-        # Clean up session if active
-        if session_id and audio_pipeline_service:
-            await audio_pipeline_service.stop_session(session_id)
+        logger.error(f"WebSocket error [{connection_id}]: {e}")
+        await cleanup_connection(connection_id)
 
-async def start_audio_session(websocket: WebSocket, message: Dict[str, Any]) -> tuple[str, AudioMetadata]:
-    """Start a new audio processing session"""
-    try:
-        if not audio_pipeline_service:
-            raise Exception("Audio pipeline service not initialized")
+async def cleanup_connection(connection_id: str):
+    """Clean up connection and associated services"""
+    if connection_id in active_connections:
+        try:
+            connection_info = active_connections[connection_id]
+            audio_capture = connection_info['audio_capture']
+            audio_streaming = connection_info['audio_streaming']
             
-        config = message.get("config", {})
+            # Stop services
+            await audio_capture.stop_capture()
+            audio_streaming.stop_streaming()
+            
+            # Remove connection
+            del active_connections[connection_id]
+            logger.info(f"Cleaned up connection: {connection_id}")
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up connection {connection_id}: {e}")
+
+async def handle_audio_chunk(websocket: WebSocket, message: Dict[str, Any], 
+                           audio_capture: AudioCaptureService, 
+                           audio_streaming: AudioStreamingService):
+    """Handle incoming audio chunk from client"""
+    try:
+        # Extract audio data
+        audio_data_b64 = message.get("data", "")
+        if not audio_data_b64:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": "No audio data provided"
+            }))
+            return
         
-        # Create audio metadata from config
-        audio_format = AudioFormat(
-            sample_rate=config.get("sampleRate", 44100),
-            channels=config.get("channels", 2),
-            bit_depth=config.get("bitDepth", 16),
-            format="PCM",
-            encoding="signed"
-        )
+        # Decode base64 audio data
+        try:
+            audio_data = base64.b64decode(audio_data_b64)
+        except Exception as e:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": f"Invalid audio data encoding: {str(e)}"
+            }))
+            return
         
-        session_id = str(uuid.uuid4())
-        audio_metadata = AudioMetadata(
-            session_id=session_id,
-            format=audio_format,
-            source_url=config.get("sourceUrl"),
-            source_type=config.get("sourceType", "youtube"),
-            language=config.get("language", "unknown"),
-            chunk_size=config.get("chunkSize", 1024)
-        )
+        # Extract metadata
+        metadata = {
+            'sample_rate': message.get('sampleRate', 16000),
+            'channels': message.get('channels', 1),
+            'timestamp': message.get('timestamp', time.time()),
+            'sequence': message.get('sequence', 0),
+            'chunk_size': len(audio_data)
+        }
         
-        # Start the session in the pipeline
-        success = await audio_pipeline_service.start_session(session_id, audio_metadata)
+        # Process through audio capture service
+        success = await audio_capture.process_audio_chunk(audio_data, metadata)
         
         if success:
-            response = {
-                "type": "session_started",
-                "session_id": session_id,
-                "status": "success",
-                "config": config
-            }
-            logger.info(f"Started session {session_id}")
-        else:
-            response = {
-                "type": "session_error",
-                "status": "error",
-                "message": "Failed to start session"
-            }
-            logger.error(f"Failed to start session")
-        
-        await websocket.send_text(json.dumps(response))
-        return session_id, audio_metadata
-        
-    except Exception as e:
-        logger.error(f"Error starting audio session: {e}")
-        await websocket.send_text(json.dumps({
-            "type": "session_error",
-            "status": "error",
-            "message": f"Session start error: {str(e)}"
-        }))
-        raise
-
-async def stop_audio_session(websocket: WebSocket, session_id: str):
-    """Stop an audio processing session"""
-    try:
-        if not audio_pipeline_service:
-            raise Exception("Audio pipeline service not initialized")
+            # Get buffer statistics
+            buffer_stats = audio_capture.get_buffer_stats()
             
-        success = await audio_pipeline_service.stop_session(session_id)
+            # Convert numpy types to Python types for JSON serialization
+            def convert_numpy_types(obj):
+                if isinstance(obj, dict):
+                    return {k: convert_numpy_types(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_numpy_types(v) for v in obj]
+                elif hasattr(obj, 'item'):  # numpy scalar
+                    return obj.item()
+                elif hasattr(obj, 'tolist'):  # numpy array
+                    return obj.tolist()
+                else:
+                    return obj
+            
+            buffer_stats = convert_numpy_types(buffer_stats)
+            
+            # Send acknowledgment with buffer status
+            await websocket.send_text(json.dumps({
+                "type": "audio_chunk_processed",
+                "status": "success",
+                "sequence": metadata['sequence'],
+                "buffer_stats": buffer_stats,
+                "server_time": time.time()
+            }))
+        else:
+            await websocket.send_text(json.dumps({
+                "type": "audio_chunk_processed",
+                "status": "failed",
+                "sequence": metadata['sequence'],
+                "message": "Failed to process audio chunk"
+            }))
+            
+    except Exception as e:
+        logger.error(f"Error handling audio chunk: {e}")
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": f"Audio chunk processing error: {str(e)}"
+        }))
+
+async def handle_audio_config(websocket: WebSocket, message: Dict[str, Any], 
+                            audio_capture: AudioCaptureService):
+    """Handle audio configuration updates"""
+    try:
+        config = message.get("config", {})
+        
+        # Start or reconfigure audio capture
+        if config.get("action") == "start":
+            success = await audio_capture.start_capture(config)
+            status = "started" if success else "failed"
+        elif config.get("action") == "stop":
+            await audio_capture.stop_capture()
+            status = "stopped"
+        else:
+            status = "configured"
         
         response = {
-            "type": "session_stopped",
-            "session_id": session_id,
-            "status": "success" if success else "error"
+            "type": "audio_config_response",
+            "status": status,
+            "config": config,
+            "server_time": time.time()
         }
         
         await websocket.send_text(json.dumps(response))
         logger.info(f"Stopped session {session_id}")
         
     except Exception as e:
-        logger.error(f"Error stopping audio session: {e}")
+        logger.error(f"Error handling audio config: {e}")
         await websocket.send_text(json.dumps({
-            "type": "session_error",
-            "status": "error",
-            "message": f"Session stop error: {str(e)}"
+            "type": "error",
+            "message": f"Audio config error: {str(e)}"
         }))
 
-async def update_session_config(websocket: WebSocket, session_id: str, message: Dict[str, Any]):
-    """Update session configuration"""
+async def handle_stream_control(websocket: WebSocket, message: Dict[str, Any],
+                              audio_capture: AudioCaptureService,
+                              audio_streaming: AudioStreamingService):
+    """Handle stream control commands"""
     try:
-        if not audio_pipeline_service:
-            raise Exception("Audio pipeline service not initialized")
-            
-        config = message.get("config", {})
+        command = message.get("command", "")
         
-        # Update pipeline config
-        audio_pipeline_service.update_config(config)
+        if command == "start_streaming":
+            audio_streaming.start_streaming()
+            status = "streaming_started"
+        elif command == "stop_streaming":
+            audio_streaming.stop_streaming()
+            status = "streaming_stopped"
+        elif command == "pause_streaming":
+            # Could implement pause functionality
+            status = "streaming_paused"
+        elif command == "resume_streaming":
+            # Could implement resume functionality
+            status = "streaming_resumed"
+        else:
+            status = "unknown_command"
+        
+        await websocket.send_text(json.dumps({
+            "type": "stream_control_response",
+            "command": command,
+            "status": status,
+            "server_time": time.time()
+        }))
+        
+    except Exception as e:
+        logger.error(f"Error handling stream control: {e}")
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": f"Stream control error: {str(e)}"
+        }))
+
+async def handle_quality_check(websocket: WebSocket, message: Dict[str, Any],
+                             audio_capture: AudioCaptureService):
+    """Handle audio quality check requests"""
+    try:
+        # Get current quality metrics and recommendations
+        quality_info = audio_capture.quality_monitor.get_recommendations()
+        buffer_stats = audio_capture.get_buffer_stats()
         
         response = {
-            "type": "config_updated",
-            "session_id": session_id,
-            "status": "success",
-            "config": config
+            "type": "quality_check_response",
+            "quality_metrics": quality_info.get('metrics', {}),
+            "recommendations": quality_info.get('recommendations', []),
+            "buffer_stats": buffer_stats,
+            "server_time": time.time()
+        }
+        
+        await websocket.send_text(json.dumps(response))
+        
+    except Exception as e:
+        logger.error(f"Error handling quality check: {e}")
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": f"Quality check error: {str(e)}"
+        }))
+
+async def handle_sync_request(websocket: WebSocket, message: Dict[str, Any],
+                            audio_streaming: AudioStreamingService):
+    """Handle clock synchronization requests"""
+    try:
+        client_timestamp = message.get("client_time", time.time())
+        server_timestamp = time.time()
+        
+        # Update synchronizer
+        audio_streaming.synchronizer.sync_clocks(client_timestamp, server_timestamp)
+        
+        response = {
+            "type": "sync_response",
+            "client_time": client_timestamp,
+            "server_time": server_timestamp,
+            "offset": audio_streaming.synchronizer.client_server_offset,
+            "jitter_estimate": audio_streaming.synchronizer.estimate_jitter()
         }
         
         await websocket.send_text(json.dumps(response))
         logger.info(f"Updated config for session {session_id}")
         
     except Exception as e:
-        logger.error(f"Error updating session config: {e}")
+        logger.error(f"Error handling sync request: {e}")
         await websocket.send_text(json.dumps({
-            "type": "config_error",
-            "status": "error",
-            "message": f"Config update error: {str(e)}"
+            "type": "error",
+            "message": f"Sync request error: {str(e)}"
+        }))
+
+async def handle_stats_request(websocket: WebSocket, message: Dict[str, Any],
+                             audio_capture: AudioCaptureService,
+                             audio_streaming: AudioStreamingService):
+    """Handle statistics requests"""
+    try:
+        stats_type = message.get("stats_type", "all")
+        
+        response = {
+            "type": "stats_response",
+            "stats_type": stats_type,
+            "server_time": time.time()
+        }
+        
+        if stats_type in ["all", "capture"]:
+            response["capture_stats"] = audio_capture.get_buffer_stats()
+        
+        if stats_type in ["all", "streaming"]:
+            response["streaming_stats"] = audio_streaming.get_streaming_stats()
+        
+        if stats_type in ["all", "system"]:
+            import psutil
+            response["system_stats"] = {
+                "cpu_percent": psutil.cpu_percent(),
+                "memory_percent": psutil.virtual_memory().percent,
+                "connections": len(active_connections)
+            }
+        
+        await websocket.send_text(json.dumps(response))
+        
+    except Exception as e:
+        logger.error(f"Error handling stats request: {e}")
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": f"Stats request error: {str(e)}"
         }))
 
 async def process_audio_data(websocket: WebSocket, session_id: str, message: Dict[str, Any]):
@@ -345,53 +466,67 @@ async def process_audio_data(websocket: WebSocket, session_id: str, message: Dic
 @app.get("/status")
 async def get_status():
     """Get current system status"""
-    pipeline_stats = {}
-    if audio_pipeline_service:
-        pipeline_stats = audio_pipeline_service.get_processing_stats()
+    try:
+        import psutil
+        system_stats = {
+            "cpu_percent": psutil.cpu_percent(),
+            "memory_percent": psutil.virtual_memory().percent,
+            "disk_usage": psutil.disk_usage('/').percent
+        }
+    except:
+        system_stats = {"error": "System stats unavailable"}
+    
+    connection_details = {}
+    for conn_id, conn_info in active_connections.items():
+        connection_details[conn_id] = {
+            "connected_at": conn_info.get('connected_at', 0),
+            "last_activity": conn_info.get('last_activity', 0),
+            "duration": time.time() - conn_info.get('connected_at', time.time())
+        }
     
     return {
         "active_connections": len(active_connections),
-        "connections": list(active_connections.keys()),
-        "pipeline_stats": pipeline_stats,
-        "system_ready": audio_pipeline_service is not None
+        "connection_details": connection_details,
+        "system_stats": system_stats,
+        "services_status": {
+            "audio_capture": "operational",
+            "audio_streaming": "operational", 
+            "compression": "operational"
+        },
+        "uptime": time.time(),
+        "version": "1.0.0"
     }
 
-@app.get("/sessions")
-async def get_sessions():
-    """Get information about all active sessions"""
-    if not audio_pipeline_service:
-        return {"sessions": [], "message": "Audio pipeline service not initialized"}
+@app.get("/stats/{connection_id}")
+async def get_connection_stats(connection_id: str):
+    """Get detailed statistics for a specific connection"""
+    if connection_id not in active_connections:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Connection {connection_id} not found"}
+        )
     
-    sessions = audio_pipeline_service.get_all_sessions_info()
-    return {
-        "sessions": sessions,
-        "total_sessions": len(sessions)
-    }
-
-@app.get("/sessions/{session_id}")
-async def get_session_info(session_id: str):
-    """Get information about a specific session"""
-    if not audio_pipeline_service:
-        return {"error": "Audio pipeline service not initialized"}
-    
-    session_info = audio_pipeline_service.get_session_info(session_id)
-    if session_info:
-        return session_info
-    else:
-        return {"error": f"Session {session_id} not found"}
-
-@app.post("/sessions/{session_id}/stop")
-async def stop_session_endpoint(session_id: str):
-    """Stop a specific session via REST API"""
-    if not audio_pipeline_service:
-        return {"error": "Audio pipeline service not initialized"}
-    
-    success = await audio_pipeline_service.stop_session(session_id)
-    return {
-        "session_id": session_id,
-        "status": "success" if success else "error",
-        "message": "Session stopped" if success else "Failed to stop session"
-    }
+    try:
+        conn_info = active_connections[connection_id]
+        audio_capture = conn_info['audio_capture']
+        audio_streaming = conn_info['audio_streaming']
+        
+        return {
+            "connection_id": connection_id,
+            "connection_info": {
+                "connected_at": conn_info.get('connected_at', 0),
+                "last_activity": conn_info.get('last_activity', 0),
+                "duration": time.time() - conn_info.get('connected_at', time.time())
+            },
+            "capture_stats": audio_capture.get_buffer_stats(),
+            "streaming_stats": audio_streaming.get_streaming_stats(),
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get stats: {str(e)}"}
+        )
 
 if __name__ == "__main__":
     logger.info("Starting TrueTone Backend Server...")

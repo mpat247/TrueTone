@@ -1,259 +1,388 @@
+#!/usr/bin/env python3
 """
-Audio Capture Service
-Handles audio capture and processing for the TrueTone backend.
+TrueTone Audio Capture Service
+Handles audio capture, buffering, and quality management
 """
 
-import numpy as np
-import logging
-from typing import Dict, Any, Optional, List
 import asyncio
+import logging
 import time
-from io import BytesIO
+from typing import Dict, Optional, Callable, Any
+import numpy as np
+import soundfile as sf
+import librosa
+from collections import deque
+import threading
+import psutil
 
 logger = logging.getLogger(__name__)
 
+class AudioBuffer:
+    """Circular buffer for continuous audio streaming with overflow protection"""
+    
+    def __init__(self, max_size: int = 1024 * 1024):  # 1MB default
+        self.max_size = max_size
+        self.buffer = deque(maxlen=max_size)
+        self.lock = threading.Lock()
+        self.overflow_count = 0
+        self.total_written = 0
+        self.total_read = 0
+        
+    def write(self, data: bytes) -> bool:
+        """Write data to buffer with overflow protection"""
+        with self.lock:
+            if len(self.buffer) + len(data) > self.max_size:
+                # Remove old data to make room
+                overflow_size = len(self.buffer) + len(data) - self.max_size
+                for _ in range(min(overflow_size, len(self.buffer))):
+                    self.buffer.popleft()
+                self.overflow_count += overflow_size
+                logger.warning(f"Audio buffer overflow: {overflow_size} bytes dropped")
+            
+            self.buffer.extend(data)
+            self.total_written += len(data)
+            return True
+    
+    def read(self, size: int) -> bytes:
+        """Read data from buffer"""
+        with self.lock:
+            if len(self.buffer) < size:
+                # Return what we have
+                data = bytes(self.buffer)
+                self.buffer.clear()
+            else:
+                data = bytes([self.buffer.popleft() for _ in range(size)])
+            
+            self.total_read += len(data)
+            return data
+    
+    def available(self) -> int:
+        """Get available bytes in buffer"""
+        with self.lock:
+            return len(self.buffer)
+    
+    def clear(self):
+        """Clear buffer"""
+        with self.lock:
+            self.buffer.clear()
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get buffer statistics"""
+        with self.lock:
+            return {
+                'size': len(self.buffer),
+                'max_size': self.max_size,
+                'overflow_count': self.overflow_count,
+                'total_written': self.total_written,
+                'total_read': self.total_read,
+                'utilization': len(self.buffer) / self.max_size * 100
+            }
+
+class AudioQualityMonitor:
+    """Monitor and optimize audio quality"""
+    
+    def __init__(self):
+        self.sample_rate = None
+        self.channels = None
+        self.bit_depth = None
+        self.quality_metrics = {}
+        self.auto_adjustment_enabled = True
+        
+    def detect_format(self, audio_data: np.ndarray, sample_rate: int) -> Dict[str, Any]:
+        """Detect audio format and quality metrics"""
+        # Detect basic properties
+        if len(audio_data.shape) == 1:
+            channels = 1
+        else:
+            channels = audio_data.shape[1] if audio_data.shape[1] < audio_data.shape[0] else audio_data.shape[0]
+        
+        # Calculate quality metrics
+        rms_level = np.sqrt(np.mean(audio_data**2))
+        peak_level = np.max(np.abs(audio_data))
+        dynamic_range = 20 * np.log10(peak_level / (rms_level + 1e-10))
+        
+        # Estimate SNR (simplified)
+        signal_power = np.mean(audio_data**2)
+        noise_floor = np.percentile(audio_data**2, 10)  # Estimate noise floor
+        snr = 10 * np.log10(signal_power / (noise_floor + 1e-10))
+        
+        self.quality_metrics = {
+            'sample_rate': sample_rate,
+            'channels': channels,
+            'rms_level': float(rms_level),
+            'peak_level': float(peak_level),
+            'dynamic_range': float(dynamic_range),
+            'snr_estimate': float(snr),
+            'clipping_detected': peak_level >= 0.99
+        }
+        
+        return self.quality_metrics
+    
+    def optimize_for_ml(self, audio_data: np.ndarray, current_sr: int, target_sr: int = 16000) -> np.ndarray:
+        """Optimize audio for ML model processing"""
+        # Resample if needed
+        if current_sr != target_sr:
+            audio_data = librosa.resample(audio_data, orig_sr=current_sr, target_sr=target_sr)
+        
+        # Convert to mono if stereo
+        if len(audio_data.shape) > 1:
+            audio_data = librosa.to_mono(audio_data.T)
+        
+        # Normalize audio
+        if np.max(np.abs(audio_data)) > 0:
+            audio_data = audio_data / np.max(np.abs(audio_data)) * 0.9
+        
+        return audio_data
+    
+    def get_recommendations(self) -> Dict[str, str]:
+        """Get quality improvement recommendations"""
+        recommendations = []
+        
+        if self.quality_metrics.get('snr_estimate', 0) < 10:
+            recommendations.append("Low SNR detected - consider noise reduction")
+        
+        if self.quality_metrics.get('clipping_detected', False):
+            recommendations.append("Audio clipping detected - reduce input level")
+        
+        if self.quality_metrics.get('dynamic_range', 0) < 10:
+            recommendations.append("Low dynamic range - check compression settings")
+        
+        return {'recommendations': recommendations, 'metrics': self.quality_metrics}
+
+class AudioStreamManager:
+    """Manage audio streaming with health monitoring and reconnection"""
+    
+    def __init__(self, max_reconnect_attempts: int = 5):
+        self.is_active = False
+        self.health_check_interval = 5.0  # seconds
+        self.max_reconnect_attempts = max_reconnect_attempts
+        self.reconnect_count = 0
+        self.last_health_check = time.time()
+        self.stream_callbacks = []
+        self.error_callbacks = []
+        self.health_monitor_task = None
+        
+    def add_stream_callback(self, callback: Callable):
+        """Add callback for stream events"""
+        self.stream_callbacks.append(callback)
+    
+    def add_error_callback(self, callback: Callable):
+        """Add callback for error events"""
+        self.error_callbacks.append(callback)
+    
+    def start_health_monitoring(self):
+        """Start health monitoring task"""
+        if self.health_monitor_task is None:
+            self.health_monitor_task = asyncio.create_task(self._health_monitor_loop())
+    
+    def stop_health_monitoring(self):
+        """Stop health monitoring task"""
+        if self.health_monitor_task:
+            self.health_monitor_task.cancel()
+            self.health_monitor_task = None
+    
+    async def _health_monitor_loop(self):
+        """Health monitoring loop"""
+        while self.is_active:
+            try:
+                await asyncio.sleep(self.health_check_interval)
+                
+                # Check system resources
+                memory_percent = psutil.virtual_memory().percent
+                cpu_percent = psutil.cpu_percent()
+                
+                if memory_percent > 90:
+                    logger.warning(f"High memory usage: {memory_percent}%")
+                    await self._notify_callbacks('memory_warning', {'usage': memory_percent})
+                
+                if cpu_percent > 80:
+                    logger.warning(f"High CPU usage: {cpu_percent}%")
+                    await self._notify_callbacks('cpu_warning', {'usage': cpu_percent})
+                
+                self.last_health_check = time.time()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Health monitor error: {e}")
+                await self._notify_error_callbacks('health_monitor_error', str(e))
+    
+    async def _notify_callbacks(self, event_type: str, data: Dict[str, Any]):
+        """Notify stream callbacks"""
+        for callback in self.stream_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(event_type, data)
+                else:
+                    callback(event_type, data)
+            except Exception as e:
+                logger.error(f"Callback error: {e}")
+    
+    async def _notify_error_callbacks(self, error_type: str, error_message: str):
+        """Notify error callbacks"""
+        for callback in self.error_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(error_type, error_message)
+                else:
+                    callback(error_type, error_message)
+            except Exception as e:
+                logger.error(f"Error callback error: {e}")
+    
+    def start_stream(self):
+        """Start audio stream"""
+        self.is_active = True
+        self.start_health_monitoring()
+        logger.info("Audio stream started")
+    
+    def stop_stream(self):
+        """Stop audio stream"""
+        self.is_active = False
+        self.stop_health_monitoring()
+        logger.info("Audio stream stopped")
+    
+    async def handle_reconnection(self, error: Exception):
+        """Handle stream reconnection with exponential backoff"""
+        if self.reconnect_count >= self.max_reconnect_attempts:
+            logger.error(f"Max reconnection attempts reached: {self.max_reconnect_attempts}")
+            await self._notify_error_callbacks('max_reconnects_reached', str(error))
+            return False
+        
+        # Exponential backoff
+        wait_time = min(2 ** self.reconnect_count, 30)  # Max 30 seconds
+        self.reconnect_count += 1
+        
+        logger.info(f"Attempting reconnection {self.reconnect_count}/{self.max_reconnect_attempts} in {wait_time}s")
+        await asyncio.sleep(wait_time)
+        
+        try:
+            # Attempt to restart stream
+            self.stop_stream()
+            await asyncio.sleep(1)
+            self.start_stream()
+            
+            # Reset reconnect count on success
+            self.reconnect_count = 0
+            await self._notify_callbacks('reconnection_success', {
+                'attempt': self.reconnect_count,
+                'wait_time': wait_time
+            })
+            return True
+            
+        except Exception as reconnect_error:
+            logger.error(f"Reconnection failed: {reconnect_error}")
+            await self._notify_error_callbacks('reconnection_failed', str(reconnect_error))
+            return await self.handle_reconnection(reconnect_error)
 
 class AudioCaptureService:
-    """Service for handling audio capture and initial processing"""
+    """Main audio capture service coordinating all components"""
     
-    def __init__(self, audio_processor):
-        self.audio_processor = audio_processor
-        self.active_sessions = {}
-        self.session_buffers = {}
+    def __init__(self):
+        self.buffer = AudioBuffer()
+        self.quality_monitor = AudioQualityMonitor()
+        self.stream_manager = AudioStreamManager()
+        self.is_capturing = False
+        self.current_format = None
         
-        # Audio quality monitoring
-        self.quality_metrics = {
-            'sample_rate_mismatches': 0,
-            'format_errors': 0,
-            'buffer_overflows': 0,
-            'total_chunks_processed': 0
-        }
+        # Setup callbacks
+        self.stream_manager.add_error_callback(self._handle_stream_error)
         
-        logger.info("AudioCaptureService initialized")
-    
-    def create_session(self, client_id: str, config: Dict[str, Any]) -> str:
-        """Create a new audio capture session"""
-        session_id = f"session_{client_id}_{int(time.time())}"
-        
-        session_config = {
-            'client_id': client_id,
-            'created_at': time.time(),
-            'sample_rate': config.get('sample_rate', 44100),
-            'channels': config.get('channels', 1),
-            'format': config.get('format', 'float32'),
-            'buffer_size': config.get('buffer_size', 4096),
-            'target_language': config.get('target_language', 'en'),
-            'voice_cloning': config.get('voice_cloning', True)
-        }
-        
-        self.active_sessions[session_id] = session_config
-        self.session_buffers[session_id] = []
-        
-        logger.info(f"Created audio capture session {session_id} for client {client_id}")
-        return session_id
-    
-    def close_session(self, session_id: str):
-        """Close an audio capture session and clean up resources"""
-        if session_id in self.active_sessions:
-            del self.active_sessions[session_id]
-        
-        if session_id in self.session_buffers:
-            del self.session_buffers[session_id]
-        
-        logger.info(f"Closed audio capture session {session_id}")
-    
-    async def process_audio_chunk(self, session_id: str, audio_data: bytes, 
-                                metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Process an incoming audio chunk"""
+    async def start_capture(self, config: Dict[str, Any]) -> bool:
+        """Start audio capture with given configuration"""
         try:
-            if session_id not in self.active_sessions:
-                raise ValueError(f"Session {session_id} not found")
+            self.is_capturing = True
+            self.stream_manager.start_stream()
             
-            session_config = self.active_sessions[session_id]
+            logger.info("Audio capture started successfully")
+            return True
             
-            # Extract metadata
-            timestamp = metadata.get('timestamp', time.time() * 1000)
-            sequence = metadata.get('sequence', 0)
-            sample_rate = metadata.get('sampleRate', session_config['sample_rate'])
-            audio_format = metadata.get('format', session_config['format'])
+        except Exception as e:
+            logger.error(f"Failed to start audio capture: {e}")
+            await self._handle_stream_error('capture_start_failed', str(e))
+            return False
+    
+    async def stop_capture(self):
+        """Stop audio capture"""
+        self.is_capturing = False
+        self.stream_manager.stop_stream()
+        self.buffer.clear()
+        logger.info("Audio capture stopped")
+    
+    async def process_audio_chunk(self, audio_data: bytes, metadata: Dict[str, Any]) -> bool:
+        """Process incoming audio chunk"""
+        try:
+            # Write to buffer
+            success = self.buffer.write(audio_data)
             
-            # Convert audio data to numpy array
-            audio_np = self._convert_audio_data(audio_data, audio_format)
+            if not success:
+                logger.warning("Failed to write audio data to buffer")
+                return False
             
-            # Validate and process audio
-            processed_audio = await self._validate_and_process_audio(
-                audio_np, sample_rate, session_config
-            )
-            
-            # Store in session buffer
-            self.session_buffers[session_id].append({
-                'audio': processed_audio,
-                'timestamp': timestamp,
-                'sequence': sequence,
-                'metadata': metadata
-            })
-            
-            # Keep buffer size manageable (max 10 seconds of audio)
-            max_buffer_size = int(session_config['sample_rate'] * 10)
-            current_buffer_size = sum(len(chunk['audio']) for chunk in self.session_buffers[session_id])
-            
-            if current_buffer_size > max_buffer_size:
-                # Remove oldest chunks to make space
-                while current_buffer_size > max_buffer_size and self.session_buffers[session_id]:
-                    removed_chunk = self.session_buffers[session_id].pop(0)
-                    current_buffer_size -= len(removed_chunk['audio'])
+            # Convert to numpy array for analysis
+            try:
+                audio_array = np.frombuffer(audio_data, dtype=np.float32)
+                sample_rate = metadata.get('sample_rate', 44100)
                 
-                self.quality_metrics['buffer_overflows'] += 1
+                # Analyze quality
+                quality_metrics = self.quality_monitor.detect_format(audio_array, sample_rate)
+                
+                # Optimize if needed
+                if self.quality_monitor.auto_adjustment_enabled:
+                    optimized_audio = self.quality_monitor.optimize_for_ml(
+                        audio_array, sample_rate, target_sr=16000
+                    )
+                    # Could store optimized version for ML processing
+                
+            except Exception as analysis_error:
+                logger.warning(f"Audio analysis failed: {analysis_error}")
             
-            # Update metrics
-            self.quality_metrics['total_chunks_processed'] += 1
-            
-            # Perform quality analysis
-            quality_metrics = self._analyze_audio_quality(processed_audio, sample_rate)
-            
-            return {
-                'status': 'success',
-                'sequence': sequence,
-                'timestamp': timestamp,
-                'quality': quality_metrics,
-                'buffer_size': len(self.session_buffers[session_id]),
-                'processed_samples': len(processed_audio)
-            }
+            return True
             
         except Exception as e:
-            logger.error(f"Error processing audio chunk for session {session_id}: {str(e)}")
-            self.quality_metrics['format_errors'] += 1
-            
-            return {
-                'status': 'error',
-                'message': str(e),
-                'sequence': metadata.get('sequence', 0),
-                'timestamp': metadata.get('timestamp', time.time() * 1000)
-            }
+            logger.error(f"Error processing audio chunk: {e}")
+            await self._handle_stream_error('chunk_processing_failed', str(e))
+            return False
     
-    def _convert_audio_data(self, audio_data: bytes, audio_format: str) -> np.ndarray:
-        """Convert audio bytes to numpy array based on format"""
-        try:
-            if audio_format == 'float32':
-                return np.frombuffer(audio_data, dtype=np.float32)
-            elif audio_format == 'int16':
-                return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-            elif audio_format == 'int32':
-                return np.frombuffer(audio_data, dtype=np.int32).astype(np.float32) / 2147483648.0
-            else:
-                raise ValueError(f"Unsupported audio format: {audio_format}")
-        except Exception as e:
-            raise ValueError(f"Error converting audio data: {str(e)}")
+    def get_audio_data(self, size: int) -> bytes:
+        """Get audio data from buffer"""
+        return self.buffer.read(size)
     
-    async def _validate_and_process_audio(self, audio_np: np.ndarray, 
-                                        sample_rate: int, session_config: Dict[str, Any]) -> np.ndarray:
-        """Validate and process audio data"""
-        # Check for valid audio data
-        if len(audio_np) == 0:
-            raise ValueError("Empty audio data")
-        
-        # Check for NaN or infinite values
-        if np.any(np.isnan(audio_np)) or np.any(np.isinf(audio_np)):
-            logger.warning("Audio contains NaN or infinite values, cleaning...")
-            audio_np = np.nan_to_num(audio_np, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        # Clip audio to valid range
-        audio_np = np.clip(audio_np, -1.0, 1.0)
-        
-        # Standardize audio format if needed
-        if sample_rate != session_config['sample_rate']:
-            logger.warning(f"Sample rate mismatch: {sample_rate} vs {session_config['sample_rate']}")
-            self.quality_metrics['sample_rate_mismatches'] += 1
-            
-            # Use audio processor to resample
-            audio_np = self.audio_processor.resample_audio(
-                audio_np, sample_rate, session_config['sample_rate']
-            )
-        
-        # Apply basic audio enhancement
-        audio_np = self._apply_audio_enhancement(audio_np)
-        
-        return audio_np
+    def get_buffer_stats(self) -> Dict[str, Any]:
+        """Get buffer statistics"""
+        stats = self.buffer.get_stats()
+        stats['quality_metrics'] = self.quality_monitor.quality_metrics
+        stats['quality_recommendations'] = self.quality_monitor.get_recommendations()
+        return stats
     
-    def _apply_audio_enhancement(self, audio_np: np.ndarray) -> np.ndarray:
-        """Apply basic audio enhancement filters"""
-        # Normalize audio
-        max_val = np.max(np.abs(audio_np))
-        if max_val > 0:
-            audio_np = audio_np / max_val * 0.95  # Leave some headroom
+    async def _handle_stream_error(self, error_type: str, error_message: str):
+        """Handle stream errors"""
+        logger.error(f"Stream error [{error_type}]: {error_message}")
         
-        # Simple high-pass filter to remove DC offset and low-frequency noise
-        if len(audio_np) > 1:
-            audio_np = np.diff(audio_np, prepend=audio_np[0])
-        
-        return audio_np
+        # Attempt recovery based on error type
+        if error_type in ['connection_lost', 'capture_start_failed']:
+            await self.stream_manager.handle_reconnection(Exception(error_message))
+        elif error_type in ['memory_warning', 'buffer_overflow']:
+            # Clear buffer and reduce quality if needed
+            self.buffer.clear()
+            logger.info("Buffer cleared due to resource constraints")
     
-    def _analyze_audio_quality(self, audio_np: np.ndarray, sample_rate: int) -> Dict[str, float]:
-        """Analyze audio quality metrics"""
-        # Calculate RMS level
-        rms = np.sqrt(np.mean(audio_np ** 2))
+    def handle_youtube_state_change(self, state: str, data: Dict[str, Any]):
+        """Handle YouTube player state changes"""
+        logger.info(f"YouTube player state changed: {state}")
         
-        # Calculate peak level
-        peak = np.max(np.abs(audio_np))
-        
-        # Calculate zero crossing rate (rough measure of speech vs noise)
-        zero_crossings = np.sum(np.diff(np.signbit(audio_np)))
-        zcr = zero_crossings / (len(audio_np) - 1) if len(audio_np) > 1 else 0
-        
-        # Calculate spectral centroid (brightness measure)
-        # This is a simplified version - in production, use FFT-based analysis
-        spectral_centroid = np.mean(np.abs(np.gradient(audio_np)))
-        
-        return {
-            'rms_level': float(rms),
-            'peak_level': float(peak),
-            'zero_crossing_rate': float(zcr),
-            'spectral_centroid': float(spectral_centroid),
-            'snr_estimate': float(20 * np.log10(rms) if rms > 0 else -60),  # Rough SNR estimate
-            'clip_detected': bool(np.any(np.abs(audio_np) >= 0.99))
-        }
-    
-    def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get information about a session"""
-        if session_id not in self.active_sessions:
-            return None
-        
-        session_config = self.active_sessions[session_id]
-        buffer_info = {
-            'chunks': len(self.session_buffers.get(session_id, [])),
-            'total_samples': sum(len(chunk['audio']) for chunk in self.session_buffers.get(session_id, [])),
-            'duration_seconds': sum(len(chunk['audio']) for chunk in self.session_buffers.get(session_id, [])) / session_config['sample_rate']
-        }
-        
-        return {
-            'session_config': session_config,
-            'buffer_info': buffer_info,
-            'quality_metrics': self.quality_metrics
-        }
-    
-    def get_buffered_audio(self, session_id: str, max_duration: float = 5.0) -> Optional[np.ndarray]:
-        """Get buffered audio for a session"""
-        if session_id not in self.session_buffers:
-            return None
-        
-        chunks = self.session_buffers[session_id]
-        if not chunks:
-            return None
-        
-        session_config = self.active_sessions[session_id]
-        max_samples = int(max_duration * session_config['sample_rate'])
-        
-        # Concatenate recent audio chunks
-        audio_data = []
-        total_samples = 0
-        
-        for chunk in reversed(chunks):  # Start from most recent
-            if total_samples + len(chunk['audio']) > max_samples:
-                break
-            audio_data.insert(0, chunk['audio'])
-            total_samples += len(chunk['audio'])
-        
-        if audio_data:
-            return np.concatenate(audio_data)
-        else:
-            return None
+        if state == 'paused':
+            # Could pause processing to save resources
+            logger.info("YouTube paused - reducing processing")
+        elif state == 'playing':
+            # Resume full processing
+            logger.info("YouTube playing - resuming full processing")
+        elif state == 'seeking':
+            # Clear buffer on seek to avoid stale data
+            self.buffer.clear()
+            logger.info("YouTube seeking - buffer cleared")
+        elif state == 'ad_started':
+            # Could switch to ad-specific processing
+            logger.info("Ad started - switching processing mode")
+        elif state == 'ad_ended':
+            # Resume normal processing
+            logger.info("Ad ended - resuming normal processing")

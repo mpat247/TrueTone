@@ -1,322 +1,262 @@
+#!/usr/bin/env python3
 """
-Audio Compression Utilities
-Handles audio compression for efficient network transmission.
+TrueTone Audio Compression Utilities
+Handles lossless audio compression for efficient transmission
 """
 
-import numpy as np
 import logging
-import zlib
-import gzip
-from typing import Dict, Any, Tuple, Optional
 import struct
-import io
+import zlib
+import lz4.frame
+from typing import Tuple, Optional, Union
+import numpy as np
+import soundfile as sf
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
-
-class AudioCompressor:
-    """Audio compression utilities for network transmission"""
+class AudioCompressionUtils:
+    """Advanced audio compression utilities with multiple algorithms"""
     
     def __init__(self):
-        self.compression_methods = {
-            'none': self._no_compression,
-            'zlib': self._zlib_compression,
-            'gzip': self._gzip_compression,
-            'delta': self._delta_compression,
-            'adaptive': self._adaptive_compression
-        }
+        self.compression_level = 6  # 1-9 for zlib
+        self.min_size_threshold = 512  # Don't compress smaller chunks
+        self.preferred_algorithm = 'lz4'  # 'lz4', 'zlib', 'flac'
+        self.fallback_algorithm = 'zlib'
         
-        # Compression parameters
-        self.zlib_level = 6  # Compression level (1-9)
-        self.delta_enabled = True
-        self.adaptive_threshold = 0.7  # Switch to different compression if ratio > threshold
+    def compress_audio_data(self, audio_data: bytes, algorithm: Optional[str] = None) -> Tuple[bytes, float, bool, str]:
+        """
+        Compress audio data using specified algorithm
+        Returns: (compressed_data, compression_ratio, was_compressed, algorithm_used)
+        """
+        if len(audio_data) < self.min_size_threshold:
+            return audio_data, 1.0, False, 'none'
         
-        logger.info("AudioCompressor initialized")
-    
-    def compress_audio(self, audio_data: np.ndarray, method: str = 'adaptive', 
-                      metadata: Optional[Dict[str, Any]] = None) -> Tuple[bytes, Dict[str, Any]]:
-        """Compress audio data using specified method"""
+        algorithm = algorithm or self.preferred_algorithm
+        
         try:
-            if method not in self.compression_methods:
-                logger.warning(f"Unknown compression method: {method}, using 'zlib'")
-                method = 'zlib'
-            
-            # Convert numpy array to bytes
-            audio_bytes = audio_data.astype(np.float32).tobytes()
-            original_size = len(audio_bytes)
-            
-            # Apply compression
-            compressed_bytes, compression_info = self.compression_methods[method](
-                audio_bytes, metadata or {}
-            )
-            
-            compressed_size = len(compressed_bytes)
-            compression_ratio = compressed_size / original_size if original_size > 0 else 1.0
-            
-            # Prepare compression metadata
-            result_metadata = {
-                'method': method,
-                'original_size': original_size,
-                'compressed_size': compressed_size,
-                'compression_ratio': compression_ratio,
-                'samples': len(audio_data),
-                'dtype': str(audio_data.dtype),
-                **compression_info
-            }
-            
-            logger.debug(f"Compressed audio: {original_size} -> {compressed_size} bytes "
-                        f"(ratio: {compression_ratio:.3f}) using {method}")
-            
-            return compressed_bytes, result_metadata
-            
-        except Exception as e:
-            logger.error(f"Error compressing audio: {str(e)}")
-            # Return uncompressed data as fallback
-            audio_bytes = audio_data.astype(np.float32).tobytes()
-            return audio_bytes, {
-                'method': 'none',
-                'original_size': len(audio_bytes),
-                'compressed_size': len(audio_bytes),
-                'compression_ratio': 1.0,
-                'error': str(e)
-            }
-    
-    def decompress_audio(self, compressed_data: bytes, 
-                        metadata: Dict[str, Any]) -> np.ndarray:
-        """Decompress audio data using metadata information"""
-        try:
-            method = metadata.get('method', 'none')
-            original_size = metadata.get('original_size', len(compressed_data))
-            samples = metadata.get('samples', original_size // 4)
-            
-            # Decompress based on method
-            if method == 'none':
-                audio_bytes = compressed_data
-            elif method == 'zlib':
-                audio_bytes = zlib.decompress(compressed_data)
-            elif method == 'gzip':
-                audio_bytes = gzip.decompress(compressed_data)
-            elif method == 'delta':
-                audio_bytes = self._delta_decompression(compressed_data, metadata)
-            elif method == 'adaptive':
-                # Adaptive method stores the actual method used
-                actual_method = metadata.get('actual_method', 'zlib')
-                if actual_method == 'delta':
-                    audio_bytes = self._delta_decompression(compressed_data, metadata)
-                elif actual_method == 'zlib':
-                    audio_bytes = zlib.decompress(compressed_data)
-                elif actual_method == 'gzip':
-                    audio_bytes = gzip.decompress(compressed_data)
-                else:
-                    audio_bytes = compressed_data
+            if algorithm == 'lz4':
+                return self._compress_lz4(audio_data)
+            elif algorithm == 'zlib':
+                return self._compress_zlib(audio_data)
+            elif algorithm == 'flac':
+                return self._compress_flac(audio_data)
             else:
-                logger.warning(f"Unknown decompression method: {method}")
-                audio_bytes = compressed_data
-            
-            # Convert back to numpy array
-            audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
-            
-            # Validate size
-            if len(audio_array) != samples:
-                logger.warning(f"Size mismatch after decompression: "
-                             f"expected {samples}, got {len(audio_array)}")
-            
-            return audio_array
-            
+                logger.warning(f"Unknown compression algorithm: {algorithm}, using fallback")
+                return self._compress_zlib(audio_data)
+                
         except Exception as e:
-            logger.error(f"Error decompressing audio: {str(e)}")
-            # Try to return raw data as float32
+            logger.warning(f"Compression with {algorithm} failed: {e}, trying fallback")
             try:
-                return np.frombuffer(compressed_data, dtype=np.float32)
-            except:
-                # Return empty array as last resort
-                return np.array([], dtype=np.float32)
+                return self._compress_zlib(audio_data)
+            except Exception as fallback_error:
+                logger.error(f"Fallback compression failed: {fallback_error}")
+                return audio_data, 1.0, False, 'none'
     
-    def _no_compression(self, audio_bytes: bytes, metadata: Dict[str, Any]) -> Tuple[bytes, Dict[str, Any]]:
-        """No compression - return data as-is"""
-        return audio_bytes, {'actual_method': 'none'}
+    def _compress_lz4(self, audio_data: bytes) -> Tuple[bytes, float, bool, str]:
+        """Compress using LZ4 (fast compression)"""
+        compressed = lz4.frame.compress(audio_data, compression_level=4)
+        compression_ratio = len(compressed) / len(audio_data)
+        
+        if compression_ratio < 0.9:  # At least 10% reduction for LZ4
+            # Prepend original size and algorithm marker
+            header = struct.pack('!BI', 1, len(audio_data))  # 1 = LZ4
+            return header + compressed, compression_ratio, True, 'lz4'
+        else:
+            return audio_data, 1.0, False, 'none'
     
-    def _zlib_compression(self, audio_bytes: bytes, metadata: Dict[str, Any]) -> Tuple[bytes, Dict[str, Any]]:
-        """Compress using zlib"""
-        compressed = zlib.compress(audio_bytes, self.zlib_level)
-        return compressed, {
-            'actual_method': 'zlib',
-            'zlib_level': self.zlib_level
-        }
+    def _compress_zlib(self, audio_data: bytes) -> Tuple[bytes, float, bool, str]:
+        """Compress using zlib (balanced compression)"""
+        compressed = zlib.compress(audio_data, level=self.compression_level)
+        compression_ratio = len(compressed) / len(audio_data)
+        
+        if compression_ratio < 0.8:  # At least 20% reduction for zlib
+            header = struct.pack('!BI', 2, len(audio_data))  # 2 = zlib
+            return header + compressed, compression_ratio, True, 'zlib'
+        else:
+            return audio_data, 1.0, False, 'none'
     
-    def _gzip_compression(self, audio_bytes: bytes, metadata: Dict[str, Any]) -> Tuple[bytes, Dict[str, Any]]:
-        """Compress using gzip"""
-        compressed = gzip.compress(audio_bytes, compresslevel=self.zlib_level)
-        return compressed, {
-            'actual_method': 'gzip',
-            'gzip_level': self.zlib_level
-        }
-    
-    def _delta_compression(self, audio_bytes: bytes, metadata: Dict[str, Any]) -> Tuple[bytes, Dict[str, Any]]:
-        """Delta compression - encode differences between samples"""
+    def _compress_flac(self, audio_data: bytes) -> Tuple[bytes, float, bool, str]:
+        """Compress using FLAC (lossless audio compression)"""
         try:
-            # Convert bytes back to float32 array for delta encoding
-            audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
+            # Assume audio_data is float32 PCM data
+            # Convert bytes to numpy array
+            audio_array = np.frombuffer(audio_data, dtype=np.float32)
             
-            if len(audio_array) == 0:
-                return audio_bytes, {'actual_method': 'delta', 'delta_samples': 0}
+            # Write to FLAC in memory
+            output_buffer = BytesIO()
+            sf.write(output_buffer, audio_array, 16000, format='FLAC', subtype='PCM_16')
+            compressed = output_buffer.getvalue()
             
-            # Calculate deltas (differences between consecutive samples)
-            deltas = np.diff(audio_array, prepend=audio_array[0])
+            compression_ratio = len(compressed) / len(audio_data)
             
-            # Quantize deltas to reduce precision for better compression
-            # Scale factor for quantization (higher = more compression, lower quality)
-            scale_factor = 1000.0
-            quantized_deltas = np.round(deltas * scale_factor).astype(np.int16)
+            if compression_ratio < 0.7:  # At least 30% reduction for FLAC
+                header = struct.pack('!BI', 3, len(audio_data))  # 3 = FLAC
+                return header + compressed, compression_ratio, True, 'flac'
+            else:
+                return audio_data, 1.0, False, 'none'
+                
+        except Exception as e:
+            logger.warning(f"FLAC compression failed: {e}")
+            return audio_data, 1.0, False, 'none'
+    
+    def decompress_audio_data(self, compressed_data: bytes) -> Tuple[bytes, bool]:
+        """
+        Decompress audio data, auto-detecting compression algorithm
+        Returns: (decompressed_data, was_compressed)
+        """
+        if len(compressed_data) < 5:  # Too small to have compression header
+            return compressed_data, False
+        
+        try:
+            # Read algorithm marker and original size
+            algorithm_id, original_size = struct.unpack('!BI', compressed_data[:5])
+            compressed_payload = compressed_data[5:]
             
-            # Convert to bytes
-            delta_bytes = quantized_deltas.tobytes()
+            if algorithm_id == 1:  # LZ4
+                return self._decompress_lz4(compressed_payload, original_size)
+            elif algorithm_id == 2:  # zlib
+                return self._decompress_zlib(compressed_payload, original_size)
+            elif algorithm_id == 3:  # FLAC
+                return self._decompress_flac(compressed_payload, original_size)
+            else:
+                logger.warning(f"Unknown compression algorithm ID: {algorithm_id}")
+                return compressed_data, False
+                
+        except Exception as e:
+            logger.error(f"Decompression failed: {e}")
+            return compressed_data, False
+    
+    def _decompress_lz4(self, compressed_data: bytes, original_size: int) -> Tuple[bytes, bool]:
+        """Decompress LZ4 data"""
+        try:
+            decompressed = lz4.frame.decompress(compressed_data)
+            if len(decompressed) == original_size:
+                return decompressed, True
+            else:
+                logger.warning(f"LZ4 decompression size mismatch: {len(decompressed)} != {original_size}")
+                return compressed_data, False
+        except Exception as e:
+            logger.error(f"LZ4 decompression failed: {e}")
+            return compressed_data, False
+    
+    def _decompress_zlib(self, compressed_data: bytes, original_size: int) -> Tuple[bytes, bool]:
+        """Decompress zlib data"""
+        try:
+            decompressed = zlib.decompress(compressed_data)
+            if len(decompressed) == original_size:
+                return decompressed, True
+            else:
+                logger.warning(f"zlib decompression size mismatch: {len(decompressed)} != {original_size}")
+                return compressed_data, False
+        except Exception as e:
+            logger.error(f"zlib decompression failed: {e}")
+            return compressed_data, False
+    
+    def _decompress_flac(self, compressed_data: bytes, original_size: int) -> Tuple[bytes, bool]:
+        """Decompress FLAC data"""
+        try:
+            # Read FLAC from memory
+            input_buffer = BytesIO(compressed_data)
+            audio_array, sample_rate = sf.read(input_buffer, dtype='float32')
             
-            # Add header with first sample and scale factor
-            header = struct.pack('!fd', audio_array[0], scale_factor)
+            # Convert back to bytes
+            decompressed = audio_array.tobytes()
             
-            # Compress the delta data
-            compressed_deltas = zlib.compress(delta_bytes, self.zlib_level)
-            
-            # Combine header and compressed deltas
-            result = header + compressed_deltas
-            
-            return result, {
-                'actual_method': 'delta',
-                'delta_samples': len(audio_array),
-                'scale_factor': scale_factor,
-                'header_size': len(header)
+            if len(decompressed) == original_size:
+                return decompressed, True
+            else:
+                logger.warning(f"FLAC decompression size mismatch: {len(decompressed)} != {original_size}")
+                return compressed_data, False
+                
+        except Exception as e:
+            logger.error(f"FLAC decompression failed: {e}")
+            return compressed_data, False
+    
+    def adapt_compression_settings(self, network_speed: float, latency: float, cpu_usage: float):
+        """Adapt compression settings based on network and system conditions"""
+        # Choose algorithm based on conditions
+        if cpu_usage > 80:  # High CPU usage
+            self.preferred_algorithm = 'lz4'  # Fastest
+        elif network_speed < 1.0:  # Slow network
+            if cpu_usage < 50:  # Have CPU headroom
+                self.preferred_algorithm = 'flac'  # Best compression
+            else:
+                self.preferred_algorithm = 'zlib'  # Balanced
+        elif latency > 300:  # High latency
+            self.preferred_algorithm = 'lz4'  # Minimize processing time
+        else:
+            self.preferred_algorithm = 'zlib'  # Default balanced
+        
+        # Adjust compression levels
+        if self.preferred_algorithm == 'zlib':
+            if network_speed < 2.0:
+                self.compression_level = 9  # Maximum compression
+            elif network_speed > 10.0:
+                self.compression_level = 3  # Faster compression
+            else:
+                self.compression_level = 6  # Default
+        
+        logger.info(f"Adapted compression: algorithm={self.preferred_algorithm}, level={self.compression_level}")
+    
+    def get_compression_stats(self) -> dict:
+        """Get compression algorithm capabilities and current settings"""
+        return {
+            'preferred_algorithm': self.preferred_algorithm,
+            'fallback_algorithm': self.fallback_algorithm,
+            'compression_level': self.compression_level,
+            'min_size_threshold': self.min_size_threshold,
+            'supported_algorithms': ['lz4', 'zlib', 'flac'],
+            'algorithm_info': {
+                'lz4': {'speed': 'fastest', 'compression': 'low', 'cpu': 'minimal'},
+                'zlib': {'speed': 'medium', 'compression': 'medium', 'cpu': 'moderate'},
+                'flac': {'speed': 'slowest', 'compression': 'highest', 'cpu': 'high'}
             }
-            
-        except Exception as e:
-            logger.error(f"Error in delta compression: {str(e)}")
-            # Fallback to zlib
-            return self._zlib_compression(audio_bytes, metadata)
-    
-    def _delta_decompression(self, compressed_data: bytes, metadata: Dict[str, Any]) -> bytes:
-        """Decompress delta-encoded audio"""
+        }
+        
         try:
-            header_size = metadata.get('header_size', 16)  # 8 bytes float64 + 8 bytes double
-            samples = metadata.get('delta_samples', 0)
+            # Extract original size from header
+            if len(compressed_data) < 4:
+                raise ValueError("Invalid compressed data format")
             
-            # Extract header
-            header = compressed_data[:header_size]
-            compressed_deltas = compressed_data[header_size:]
+            original_size = struct.unpack('!I', compressed_data[:4])[0]
+            compressed_content = compressed_data[4:]
             
-            # Unpack header
-            first_sample, scale_factor = struct.unpack('!fd', header)
+            # Decompress
+            decompressed = zlib.decompress(compressed_content)
             
-            # Decompress deltas
-            delta_bytes = zlib.decompress(compressed_deltas)
-            quantized_deltas = np.frombuffer(delta_bytes, dtype=np.int16)
+            # Verify size
+            if len(decompressed) != original_size:
+                raise ValueError(f"Decompressed size mismatch: expected {original_size}, got {len(decompressed)}")
             
-            # Convert back to float deltas
-            deltas = quantized_deltas.astype(np.float32) / scale_factor
-            
-            # Reconstruct audio by cumulative sum
-            audio_array = np.empty(len(deltas), dtype=np.float32)
-            audio_array[0] = first_sample
-            
-            for i in range(1, len(deltas)):
-                audio_array[i] = audio_array[i-1] + deltas[i]
-            
-            return audio_array.tobytes()
+            return decompressed
             
         except Exception as e:
-            logger.error(f"Error in delta decompression: {str(e)}")
+            logger.error(f"Audio decompression failed: {e}")
             raise
     
-    def _adaptive_compression(self, audio_bytes: bytes, metadata: Dict[str, Any]) -> Tuple[bytes, Dict[str, Any]]:
-        """Adaptive compression - choose best method based on data characteristics"""
-        try:
-            # Try different methods and choose the best one
-            methods_to_try = ['zlib', 'delta']
-            best_method = 'zlib'
-            best_compressed: bytes = audio_bytes
-            best_ratio = 1.0
-            best_info: Dict[str, Any] = {}
-            
-            for method in methods_to_try:
-                try:
-                    compressed, info = self.compression_methods[method](audio_bytes, metadata)
-                    ratio = len(compressed) / len(audio_bytes)
-                    
-                    if compressed and ratio < best_ratio:
-                        best_method = method
-                        best_compressed = compressed
-                        best_ratio = ratio
-                        best_info = info
-                        
-                except Exception as e:
-                    logger.debug(f"Method {method} failed: {str(e)}")
-                    continue
-            
-            # If no method worked well, use no compression
-            if best_ratio > self.adaptive_threshold:
-                best_method = 'none'
-                best_compressed = audio_bytes
-                best_info = {'actual_method': 'none'}
-            
-            best_info['adaptive_choice'] = best_method
-            best_info['adaptive_ratio'] = str(best_ratio)
-            
-            return best_compressed, best_info
-            
-        except Exception as e:
-            logger.error(f"Error in adaptive compression: {str(e)}")
-            return audio_bytes, {'actual_method': 'none', 'error': str(e)}
+    def set_compression_level(self, level: int):
+        """Set compression level (1-9)"""
+        if 1 <= level <= 9:
+            self.compression_level = level
+        else:
+            logger.warning(f"Invalid compression level {level}, using default")
     
-    def estimate_compression_ratio(self, audio_data: np.ndarray, method: str = 'zlib') -> float:
-        """Estimate compression ratio without actually compressing"""
+    def estimate_compression_benefit(self, audio_data: bytes) -> float:
+        """Estimate compression benefit without actually compressing"""
+        if len(audio_data) < self.min_size_threshold:
+            return 1.0  # No benefit
+        
+        # Simple heuristic based on data entropy
+        # Higher entropy = less compressible
         try:
-            if len(audio_data) == 0:
-                return 1.0
+            # Count unique bytes
+            unique_bytes = len(set(audio_data))
+            entropy_estimate = unique_bytes / 256.0
             
-            # Quick estimation based on audio characteristics
-            if method == 'delta':
-                # Delta compression works well with smooth signals
-                if len(audio_data) > 1:
-                    deltas = np.diff(audio_data)
-                    delta_variance = np.var(deltas)
-                    signal_variance = np.var(audio_data)
-                    
-                    if signal_variance > 0:
-                        smoothness_ratio = delta_variance / signal_variance
-                        # Smoother signals compress better with delta
-                        estimated_ratio = 0.3 + (smoothness_ratio * 0.6)
-                    else:
-                        estimated_ratio = 0.5
-                else:
-                    estimated_ratio = 0.5
+            # Estimate compression ratio
+            estimated_ratio = 0.3 + (entropy_estimate * 0.6)  # 0.3-0.9 range
+            return estimated_ratio
             
-            elif method in ['zlib', 'gzip']:
-                # General purpose compression - estimate based on entropy
-                # Calculate rough entropy estimate
-                unique_values = len(np.unique(audio_data.astype(np.int16)))
-                max_possible_values = 65536  # int16 range
-                
-                if unique_values > 0:
-                    entropy_ratio = unique_values / max_possible_values
-                    # Higher entropy (more unique values) = worse compression
-                    estimated_ratio = 0.4 + (entropy_ratio * 0.5)
-                else:
-                    estimated_ratio = 0.2  # Very compressible
-            
-            else:
-                estimated_ratio = 1.0  # No compression
-            
-            return float(min(1.0, max(0.1, estimated_ratio)))
-            
-        except Exception as e:
-            logger.error(f"Error estimating compression ratio: {str(e)}")
-            return 0.7  # Conservative estimate
-    
-    def get_compression_stats(self) -> Dict[str, Any]:
-        """Get compression statistics and performance info"""
-        return {
-            'available_methods': list(self.compression_methods.keys()),
-            'default_method': 'adaptive',
-            'zlib_level': self.zlib_level,
-            'delta_enabled': self.delta_enabled,
-            'adaptive_threshold': self.adaptive_threshold
-        }
+        except Exception:
+            return 0.8  # Conservative estimate

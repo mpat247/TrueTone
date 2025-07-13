@@ -5,10 +5,17 @@ websockets==12.0
 python-multipart==0.0.6
 
 # Audio processing
-numpy==1.26.3
+pyaudio==0.2.11
+numpy==1.26.4
 soundfile==0.12.1
 librosa==0.10.1
-resampy==0.4.2
+resampy==0.4.3
+webrtcvad==2.0.10
+
+# Audio compression and streaming
+soundfile==0.12.1
+psutil==5.9.6
+scipy==1.11.4
 
 # ML models and inference
 torch==2.2.1
